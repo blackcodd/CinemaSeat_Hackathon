@@ -25,7 +25,7 @@ async function startWorker() {
  */
 async function processPaymentStateTransition(eventData) {
   const { event_id, payment_id, booking_ref, status, raw_payload } = eventData;
-  const isSuccess = status === 'SUCCESS' || status === 'CONFIRMED' || status === 'COMPLETED';
+  const isSuccess = status === 'SUCCEEDED' || status === 'SUCCESS' || status === 'CONFIRMED' || status === 'COMPLETED';
 
   const client = await pool.connect();
   try {
@@ -41,16 +41,20 @@ async function processPaymentStateTransition(eventData) {
 
     const booking = bRes.rows[0];
     const { showtime_id, seat_id } = booking;
+    const finalPaymentId = payment_id || `PAY-${booking_ref}`;
 
     if (isSuccess) {
       // Confirm booking & seat status
       await client.query("UPDATE bookings SET status = 'CONFIRMED', updated_at = NOW() WHERE booking_ref = $1", [booking_ref]);
       await client.query("UPDATE seat_status SET status = 'CONFIRMED', updated_at = NOW() WHERE showtime_id = $1 AND seat_id = $2", [showtime_id, seat_id]);
+
       await client.query(`
         INSERT INTO payments (payment_id, booking_ref, status, raw_last_callback, created_at, updated_at)
         VALUES ($1, $2, 'CONFIRMED', $3, NOW(), NOW())
         ON CONFLICT (payment_id) DO UPDATE SET status = 'CONFIRMED', raw_last_callback = EXCLUDED.raw_last_callback, updated_at = NOW();
-      `, [payment_id || `PAY-${booking_ref}`, booking_ref, raw_payload || eventData]);
+      `, [finalPaymentId, booking_ref, raw_payload || eventData]);
+
+      await client.query("UPDATE payments SET status = 'CONFIRMED', updated_at = NOW() WHERE booking_ref = $1", [booking_ref]);
 
       await client.query('COMMIT');
 
@@ -61,17 +65,20 @@ async function processPaymentStateTransition(eventData) {
         seat_id,
         status: 'CONFIRMED',
       });
-      console.log(`[Worker Service] Booking ${booking_ref} successfully CONFIRMED.`);
+      console.log(`[Worker Service] Booking ${booking_ref} successfully CONFIRMED (event: ${event_id}, payment: ${finalPaymentId}).`);
 
     } else {
       // Mark booking as FAILED and release seat
       await client.query("UPDATE bookings SET status = 'FAILED', updated_at = NOW() WHERE booking_ref = $1", [booking_ref]);
       await client.query("UPDATE seat_status SET status = 'AVAILABLE', held_by_booking_ref = NULL, hold_expires_at = NULL, updated_at = NOW() WHERE showtime_id = $1 AND seat_id = $2", [showtime_id, seat_id]);
+
       await client.query(`
         INSERT INTO payments (payment_id, booking_ref, status, raw_last_callback, created_at, updated_at)
         VALUES ($1, $2, 'FAILED', $3, NOW(), NOW())
         ON CONFLICT (payment_id) DO UPDATE SET status = 'FAILED', raw_last_callback = EXCLUDED.raw_last_callback, updated_at = NOW();
-      `, [payment_id || `PAY-${booking_ref}`, booking_ref, raw_payload || eventData]);
+      `, [finalPaymentId, booking_ref, raw_payload || eventData]);
+
+      await client.query("UPDATE payments SET status = 'FAILED', updated_at = NOW() WHERE booking_ref = $1", [booking_ref]);
 
       await client.query('COMMIT');
 
@@ -85,7 +92,7 @@ async function processPaymentStateTransition(eventData) {
         seat_id,
         status: 'AVAILABLE',
       });
-      console.log(`[Worker Service] Booking ${booking_ref} marked FAILED. Seat released.`);
+      console.log(`[Worker Service] Booking ${booking_ref} marked FAILED (status: ${status}). Seat released.`);
     }
   } catch (err) {
     await client.query('ROLLBACK');
