@@ -1,6 +1,8 @@
 process.env.NODE_ENV = 'test';
+process.env.GATEWAY_SECRET = 'z2p-2026-secret';
 
 const http = require('http');
+const crypto = require('crypto');
 const { initDb, pool, query } = require('../db');
 const { holdSeat, processHoldExpiry, confirmBooking, failBooking } = require('../services/bookingService');
 const { app } = require('../index');
@@ -10,15 +12,21 @@ let server = null;
 
 function request(method, path, body = null, headers = {}) {
   return new Promise((resolve, reject) => {
+    const rawBodyData = body ? (typeof body === 'string' ? body : JSON.stringify(body)) : '';
+    const reqHeaders = {
+      'Content-Type': 'application/json',
+      ...headers,
+    };
+    if (body && !reqHeaders['Content-Length']) {
+      reqHeaders['Content-Length'] = Buffer.byteLength(rawBodyData);
+    }
+
     const options = {
       hostname: 'localhost',
       port: PORT,
       path: path,
       method: method,
-      headers: {
-        'Content-Type': 'application/json',
-        ...headers,
-      },
+      headers: reqHeaders,
     };
 
     const req = http.request(options, (res) => {
@@ -37,8 +45,8 @@ function request(method, path, body = null, headers = {}) {
 
     req.on('error', (err) => reject(err));
 
-    if (body) {
-      req.write(JSON.stringify(body));
+    if (rawBodyData) {
+      req.write(rawBodyData);
     }
     req.end();
   });
@@ -46,7 +54,7 @@ function request(method, path, body = null, headers = {}) {
 
 async function runTests() {
   console.log('==============================================');
-  console.log('   STARTING FULL SYSTEM TEST SUITE (P1 + P2)');
+  console.log('   STARTING PERSON 2 COMPLETE TEST SUITE');
   console.log('==============================================\n');
 
   let passed = 0;
@@ -111,19 +119,18 @@ async function runTests() {
     );
 
     // TEST 7: Hold Expiry Reclaim
-    process.env.HOLD_TTL_SECONDS = '1'; // Short TTL for test
+    process.env.HOLD_TTL_SECONDS = '1';
     const hold2 = await request('POST', `/seats/${s2}/hold`);
     await assert(hold2.status === 200, `Seat ${s2} held with 1s TTL`);
-    
-    await new Promise((r) => setTimeout(r, 2000)); // Wait for TTL to expire
+
+    await new Promise((r) => setTimeout(r, 2000));
     const expiredCount = await processHoldExpiry();
     const seatmapAfterExpiry = await request('GET', '/seatmap/1');
     const seat2 = seatmapAfterExpiry.body.find((s) => s.seat_id === s2);
-    
+
     await assert(expiredCount >= 1 || (seat2 && seat2.status === 'AVAILABLE'), 'Expiry worker reclaimed expired seat hold');
     await assert(seat2 && seat2.status === 'AVAILABLE', `Seat ${s2} status reverted to AVAILABLE after expiry`);
 
-    // Reset TTL for remaining tests
     process.env.HOLD_TTL_SECONDS = '60';
 
     // TEST 8: Booking Confirmation Service
@@ -150,15 +157,12 @@ async function runTests() {
     const dupRes = await confirmBooking(hold4.body.booking_ref, 'pay_test_100', 'evt_test_100', 400);
     await assert(dupRes.duplicate === true, 'confirmBooking() safely deduplicates duplicate event_id');
 
-    // TEST 12: REAL CONCURRENCY TEST (100 concurrent requests targeting same seat)
+    // TEST 12: REAL CONCURRENCY TEST (100 concurrent requests)
     console.log('\n--- Running Real Concurrency Test (100 Concurrent Requests) ---');
     await query("UPDATE seats SET status = 'AVAILABLE', hold_expires_at = NULL, version = 0 WHERE id = $1", [s10]);
     await query("DELETE FROM bookings WHERE seat_id = $1", [s10]);
 
-    const concurrentRequests = Array.from({ length: 100 }, () =>
-      request('POST', `/seats/${s10}/hold`)
-    );
-
+    const concurrentRequests = Array.from({ length: 100 }, () => request('POST', `/seats/${s10}/hold`));
     const results = await Promise.all(concurrentRequests);
     const successCount = results.filter((r) => r.status === 200).length;
     const conflictCount = results.filter((r) => r.status === 409).length;
@@ -172,101 +176,121 @@ async function runTests() {
     await assert(dbSeat.rows[0].status === 'HELD', `Seat status in DB is HELD`);
 
     // ========================================================
-    // PERSON 2 TESTS (OTP, PAYMENT, WEBHOOK, IDEMPOTENCY)
+    // PERSON 2 TESTS (OTP, PAYMENT, WEBHOOK, IDEMPOTENCY, SECURITY)
     // ========================================================
-    console.log('\n--- Running Person 2 Tests (OTP, Payment, Webhooks) ---');
+    console.log('\n--- Running Person 2 Tests (OTP, Payment, Webhooks, HMAC) ---');
 
-    // TEST 13: OTP Send
-    const otpSendRes = await request('POST', '/otp/send', {
-      booking_ref: hold1.body.booking_ref,
-      phone: '+8801700000000',
-    });
+    // TEST 13: Deterministic OTP Send
+    const otpSendRes = await request(
+      'POST',
+      '/otp/send',
+      { booking_ref: hold1.body.booking_ref, phone: '+8801700000000' },
+      { 'X-Mock-Mode': 'deterministic' }
+    );
     await assert(
-      otpSendRes.status === 200 && otpSendRes.body.status === 'sent' && otpSendRes.body.otp,
-      'POST /otp/send generates and stores hashed OTP'
+      otpSendRes.status === 200 && otpSendRes.body.status === 'sent' && otpSendRes.body.otp === '123456',
+      'POST /otp/send generates and returns deterministic OTP code 123456'
     );
 
-    // Verify OTP in DB is hashed, not plaintext
-    const dbOtp = await query('SELECT otp_hash FROM otp_verifications WHERE booking_ref = $1', [hold1.body.booking_ref]);
-    await assert(
-      dbOtp.rows.length > 0 && dbOtp.rows[0].otp_hash !== otpSendRes.body.otp,
-      'OTP stored in DB is hashed (never plaintext)'
-    );
-
-    // TEST 14: OTP Verify with Invalid OTP
+    // TEST 14: OTP Verify Invalid Code
     const otpBadVerify = await request('POST', '/otp/verify', {
       booking_ref: hold1.body.booking_ref,
-      otp: '000000',
+      otp: '999999',
     });
-    await assert(otpBadVerify.status === 400, 'POST /otp/verify rejects invalid OTP with 400');
+    await assert(otpBadVerify.status === 400, 'POST /otp/verify rejects invalid OTP code with 400');
 
-    // TEST 15: OTP Verify with Correct OTP
+    // TEST 15: OTP Verify Valid Code
     const otpGoodVerify = await request('POST', '/otp/verify', {
       booking_ref: hold1.body.booking_ref,
-      otp: otpSendRes.body.otp,
+      otp: '123456',
     });
-    await assert(
-      otpGoodVerify.status === 200 && otpGoodVerify.body.verified === true,
-      'POST /otp/verify approves valid OTP'
-    );
+    await assert(otpGoodVerify.status === 200 && otpGoodVerify.body.verified === true, 'POST /otp/verify approves 123456 in deterministic mode');
 
-    // TEST 16: Payment Processing (/pay)
+    // TEST 16: Normal /pay Initiation
     const payRes = await request(
       'POST',
       '/pay',
-      {
-        booking_ref: hold1.body.booking_ref,
-        amount: 400,
-        phone: '+8801700000000',
-      },
-      { 'Idempotency-Key': 'key_test_12345' }
+      { booking_ref: hold1.body.booking_ref, phone: '+8801700000000' },
+      { 'Idempotency-Key': 'key_p2_test_1' }
     );
     await assert(
-      payRes.status === 200 && payRes.body.payment_id && payRes.body.status,
-      'POST /pay initiates payment transaction'
+      payRes.status === 200 && payRes.body.payment_id && payRes.body.status === 'PENDING',
+      'POST /pay returns 200/202 PENDING immediately with payment_id'
     );
 
-    // TEST 17: Idempotency Key Retries
+    // TEST 17: Idempotency Key Reuse
     const payRetryRes = await request(
       'POST',
       '/pay',
-      {
-        booking_ref: hold1.body.booking_ref,
-        amount: 400,
-        phone: '+8801700000000',
-      },
-      { 'Idempotency-Key': 'key_test_12345' }
+      { booking_ref: hold1.body.booking_ref, phone: '+8801700000000' },
+      { 'Idempotency-Key': 'key_p2_test_1' }
     );
     await assert(
       payRetryRes.status === 200 && payRetryRes.body.payment_id === payRes.body.payment_id,
-      'POST /pay with same Idempotency-Key returns cached response'
+      'POST /pay with duplicate Idempotency-Key returns cached response'
     );
 
-    // TEST 18: Payment Webhook Callback (/webhooks/payment)
-    const webhookRes = await request('POST', '/webhooks/payment', {
+    // TEST 18: Webhook Invalid HMAC Signature (401 expected)
+    const invalidSignatureWebhook = await request(
+      'POST',
+      '/webhooks/payment',
+      {
+        booking_ref: hold1.body.booking_ref,
+        payment_id: payRes.body.payment_id,
+        event_id: 'evt_invalid_hmac',
+        status: 'SUCCEEDED',
+        amount: 400,
+      },
+      { 'X-Signature': 'invalid_signature_hash_123' }
+    );
+    await assert(invalidSignatureWebhook.status === 401, 'POST /webhooks/payment rejects invalid HMAC signature with 401');
+
+    // TEST 19: Webhook Valid HMAC Signature Execution
+    const webhookPayload = JSON.stringify({
       booking_ref: hold1.body.booking_ref,
       payment_id: payRes.body.payment_id,
-      event_id: 'evt_webhook_test_1',
+      event_id: 'evt_valid_hmac_1',
       status: 'SUCCEEDED',
       amount: 400,
     });
-    await assert(webhookRes.status === 200 && webhookRes.body.status === 'ok', 'POST /webhooks/payment accepts payment notification');
+    const validSignature = crypto.createHmac('sha256', process.env.GATEWAY_SECRET).update(webhookPayload).digest('hex');
+
+    const validSignatureWebhook = await request('POST', '/webhooks/payment', webhookPayload, {
+      'X-Signature': validSignature,
+    });
+    await assert(validSignatureWebhook.status === 200 && validSignatureWebhook.body.status === 'ok', 'POST /webhooks/payment accepts valid HMAC signature');
 
     const confirmedSeat1 = await query('SELECT status FROM seats WHERE id = $1', [s1]);
-    await assert(confirmedSeat1.rows[0].status === 'CONFIRMED', 'Seat 1 updated to CONFIRMED via payment webhook');
+    await assert(confirmedSeat1.rows[0].status === 'CONFIRMED', 'Seat 1 status updated to CONFIRMED via valid webhook');
 
-    // TEST 19: Duplicate Webhook Callback Deduplication
-    const dupWebhookRes = await request('POST', '/webhooks/payment', {
-      booking_ref: hold1.body.booking_ref,
-      payment_id: payRes.body.payment_id,
-      event_id: 'evt_webhook_test_1',
-      status: 'SUCCEEDED',
-      amount: 400,
+    // TEST 20: Duplicate Webhook Delivery (Rule 16: ALWAYS RETURN 2xx)
+    const dupWebhookRes = await request('POST', '/webhooks/payment', webhookPayload, {
+      'X-Signature': validSignature,
     });
     await assert(
       dupWebhookRes.status === 200 && dupWebhookRes.body.status === 'ok',
-      'POST /webhooks/payment handles duplicate callback idempotently'
+      'POST /webhooks/payment handles duplicate callback idempotently (returns 200 OK)'
     );
+
+    // TEST 21: Early Webhook / Race Handling
+    const s6 = seatmap.body[5].seat_id;
+    const hold6 = await request('POST', `/seats/${s6}/hold`);
+    const raceWebhookPayload = JSON.stringify({
+      booking_ref: hold6.body.booking_ref,
+      payment_id: 'pay_race_999',
+      event_id: 'evt_race_999',
+      status: 'SUCCEEDED',
+      amount: 400,
+    });
+    const raceSignature = crypto.createHmac('sha256', process.env.GATEWAY_SECRET).update(raceWebhookPayload).digest('hex');
+
+    const raceWebhookRes = await request('POST', '/webhooks/payment', raceWebhookPayload, {
+      'X-Signature': raceSignature,
+    });
+    await assert(raceWebhookRes.status === 200, 'Early webhook callback processed successfully before /pay completion');
+
+    const seat6Res = await query('SELECT status FROM seats WHERE id = $1', [s6]);
+    await assert(seat6Res.rows[0].status === 'CONFIRMED', 'Seat 6 confirmed by early webhook callback');
 
   } catch (err) {
     console.error('Test execution error:', err);

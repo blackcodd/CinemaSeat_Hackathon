@@ -1,11 +1,62 @@
+const http = require('http');
 const crypto = require('crypto');
 const { query } = require('../db');
+
+const GATEWAY_URL = process.env.GATEWAY_URL || 'http://gateway:9000';
+const OTP_CALLBACK_URL = process.env.OTP_CALLBACK_URL || 'http://backend:4000/webhooks/otp';
 
 function hashOtp(otp) {
   return crypto.createHash('sha256').update(String(otp).trim()).digest('hex');
 }
 
-async function sendOtp(bookingRef, phone) {
+function makeGatewayPost(urlStr, data, extraHeaders = {}) {
+  return new Promise((resolve, reject) => {
+    try {
+      const parsedUrl = new URL(urlStr);
+      const postData = JSON.stringify(data);
+
+      const headers = {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(postData),
+        ...extraHeaders,
+      };
+
+      const options = {
+        hostname: parsedUrl.hostname,
+        port: parsedUrl.port || 80,
+        path: parsedUrl.pathname,
+        method: 'POST',
+        headers,
+      };
+
+      const req = http.request(options, (res) => {
+        let responseData = '';
+        res.on('data', (chunk) => (responseData += chunk));
+        res.on('end', () => {
+          let json = null;
+          try {
+            json = JSON.parse(responseData);
+          } catch (e) {
+            json = { raw: responseData };
+          }
+          resolve({ statusCode: res.statusCode, body: json });
+        });
+      });
+
+      req.setTimeout(5000, () => {
+        req.destroy(new Error('Gateway request timeout'));
+      });
+
+      req.on('error', (err) => reject(err));
+      req.write(postData);
+      req.end();
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+async function sendOtp(bookingRef, phone, headers = {}) {
   if (!bookingRef || !phone) {
     const err = new Error('booking_ref and phone are required');
     err.statusCode = 400;
@@ -20,8 +71,8 @@ async function sendOtp(bookingRef, phone) {
     throw err;
   }
 
-  // Generate 6-digit numeric OTP
-  const otp = Math.floor(100000 + Math.random() * 900000).toString();
+  const isDeterministic = headers['x-mock-mode'] === 'deterministic';
+  const otp = isDeterministic ? '123456' : Math.floor(100000 + Math.random() * 900000).toString();
   const otpHash = hashOtp(otp);
   const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes TTL
 
@@ -34,7 +85,19 @@ async function sendOtp(bookingRef, phone) {
     [bookingRef, phone, otpHash, expiresAt.toISOString()]
   );
 
-  return { status: 'sent', otp };
+  // Send request to Mock Gateway /otp/send asynchronously
+  const mockHeaders = {};
+  if (headers['x-mock-mode']) mockHeaders['x-mock-mode'] = headers['x-mock-mode'];
+
+  makeGatewayPost(
+    `${GATEWAY_URL}/otp/send`,
+    { phone, ref: bookingRef, callback_url: OTP_CALLBACK_URL },
+    mockHeaders
+  ).catch((err) => {
+    console.warn(`Gateway OTP send warning: ${err.message}`);
+  });
+
+  return { status: 'sent', ref: bookingRef, otp };
 }
 
 async function verifyOtp(bookingRef, otp) {
@@ -44,6 +107,27 @@ async function verifyOtp(bookingRef, otp) {
     throw err;
   }
 
+  // First try gateway verification if gateway is reachable
+  try {
+    const gwRes = await makeGatewayPost(`${GATEWAY_URL}/otp/verify`, {
+      ref: bookingRef,
+      code: String(otp),
+    });
+
+    if (gwRes.statusCode === 200 && gwRes.body && gwRes.body.verified) {
+      await query(`UPDATE otp_verifications SET verified_at = NOW() WHERE booking_ref = $1`, [bookingRef]);
+      return { verified: true };
+    } else if (gwRes.statusCode === 400 || gwRes.statusCode === 429) {
+      const err = new Error(gwRes.body?.error || (gwRes.statusCode === 429 ? 'Too many attempts' : 'Invalid OTP'));
+      err.statusCode = gwRes.statusCode;
+      throw err;
+    }
+  } catch (err) {
+    if (err.statusCode) throw err;
+    console.warn(`Gateway /otp/verify unreachable (${err.message}). Falling back to local hashed verification.`);
+  }
+
+  // Local fallback verification against stored hash
   const res = await query(
     `SELECT * FROM otp_verifications WHERE booking_ref = $1 ORDER BY id DESC LIMIT 1`,
     [bookingRef]
@@ -67,30 +151,21 @@ async function verifyOtp(bookingRef, otp) {
     throw err;
   }
 
-  if (record.attempts >= 3) {
+  if (record.attempts >= 5) {
     const err = new Error('Too many failed attempts');
-    err.statusCode = 400;
+    err.statusCode = 429;
     throw err;
   }
 
   const inputHash = hashOtp(otp);
   if (inputHash !== record.otp_hash) {
-    // Increment attempts
-    await query(
-      `UPDATE otp_verifications SET attempts = attempts + 1 WHERE id = $1`,
-      [record.id]
-    );
+    await query(`UPDATE otp_verifications SET attempts = attempts + 1 WHERE id = $1`, [record.id]);
     const err = new Error('Invalid OTP');
     err.statusCode = 400;
     throw err;
   }
 
-  // Verification succeeded
-  await query(
-    `UPDATE otp_verifications SET verified_at = NOW() WHERE id = $1`,
-    [record.id]
-  );
-
+  await query(`UPDATE otp_verifications SET verified_at = NOW() WHERE id = $1`, [record.id]);
   return { verified: true };
 }
 

@@ -10,7 +10,15 @@ const { processPayment, handlePaymentWebhook, verifyWebhookSignature } = require
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+
+// Express middleware capturing rawBody for HMAC-SHA256 signature verification
+app.use(
+  express.json({
+    verify: (req, res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
 
 /**
  * HOOK 1: GET /health
@@ -104,13 +112,13 @@ app.post('/seats/:seat_id/hold', async (req, res, next) => {
 
 /**
  * POST /pay
- * Process payment with Mock Gateway, supporting Idempotency-Key and control headers.
+ * Process payment with Mock Gateway, returning 202/200 PENDING status immediately.
  */
 app.post('/pay', async (req, res, next) => {
   try {
     const { booking_ref, amount, phone } = req.body;
     const idempotency_key = req.headers['idempotency-key'] || req.headers['x-idempotency-key'];
-    
+
     const result = await processPayment({
       booking_ref,
       amount,
@@ -133,8 +141,9 @@ app.post('/pay', async (req, res, next) => {
  */
 app.post('/otp/send', async (req, res, next) => {
   try {
-    const { booking_ref, phone } = req.body;
-    const result = await sendOtp(booking_ref, phone);
+    const booking_ref = req.body.booking_ref || req.body.ref;
+    const { phone } = req.body;
+    const result = await sendOtp(booking_ref, phone, req.headers);
     res.status(200).json(result);
   } catch (err) {
     if (err.statusCode) {
@@ -149,7 +158,8 @@ app.post('/otp/send', async (req, res, next) => {
  */
 app.post('/otp/verify', async (req, res, next) => {
   try {
-    const { booking_ref, otp } = req.body;
+    const booking_ref = req.body.booking_ref || req.body.ref;
+    const otp = req.body.otp || req.body.code;
     const result = await verifyOtp(booking_ref, otp);
     res.status(200).json(result);
   } catch (err) {
@@ -158,6 +168,16 @@ app.post('/otp/verify', async (req, res, next) => {
     }
     next(err);
   }
+});
+
+/**
+ * POST /webhooks/otp
+ */
+app.post('/webhooks/otp', (req, res) => {
+  if (!verifyWebhookSignature(req)) {
+    return res.status(401).json({ error: 'Invalid HMAC signature' });
+  }
+  res.status(200).json({ status: 'ok' });
 });
 
 /**
@@ -170,10 +190,10 @@ const handleWebhook = async (req, res, next) => {
     }
 
     await handlePaymentWebhook(req.body);
+    // Gateway Callback Rule 16: ALWAYS RETURN 2xx (even for duplicates)
     res.status(200).json({ status: 'ok' });
   } catch (err) {
-    console.error('Webhook processing error:', err);
-    // Webhook should respond HTTP 200 to gateway unless payload is bad
+    console.error('Webhook processing notice:', err.message);
     res.status(200).json({ status: 'ok', warning: err.message });
   }
 };

@@ -27,6 +27,7 @@ docker compose up --build
 | `DATABASE_URL` | PostgreSQL connection string | `postgres://cinemaseat:cinemaseat@postgres:5432/cinemaseat` |
 | `HOLD_TTL_SECONDS` | Duration in seconds before a held seat expires | `60` |
 | `GATEWAY_URL` | URL of mock payment gateway | `http://gateway:9000` |
+| `GATEWAY_SECRET` | Secret key for HMAC-SHA256 signature verification | `z2p-2026-secret` |
 | `PORT` | Backend HTTP port | `4000` |
 
 ---
@@ -116,11 +117,35 @@ curl -X POST http://localhost:4000/seats/1/hold \
 }
 ```
 
-**Conflict Response (409 Conflict):**
+### 6. Process Payment (Person 2 Integration)
+```bash
+curl -X POST http://localhost:4000/pay \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: payment-REF-1723112400000-849201" \
+  -d '{"booking_ref":"REF-1723112400000-849201","phone":"+8801700000000"}'
+```
+**Response (200/202 PENDING):**
 ```json
 {
-  "error": "Seat is currently held by another user"
+  "payment_id": "pay_1786166051876_7620",
+  "status": "PENDING",
+  "booking_ref": "REF-1723112400000-849201",
+  "amount": 400
 }
+```
+
+### 7. Send & Verify OTP (Person 2 Authentication)
+```bash
+# Send OTP
+curl -X POST http://localhost:4000/otp/send \
+  -H "Content-Type: application/json" \
+  -H "X-Mock-Mode: deterministic" \
+  -d '{"booking_ref":"REF-1723112400000-849201","phone":"+8801700000000"}'
+
+# Verify OTP (deterministic code 123456)
+curl -X POST http://localhost:4000/otp/verify \
+  -H "Content-Type: application/json" \
+  -d '{"booking_ref":"REF-1723112400000-849201","otp":"123456"}'
 ```
 
 ---
@@ -134,4 +159,5 @@ curl -X POST http://localhost:4000/seats/1/hold \
 
 ## 📄 Documentation
 - [Database Schema & Architecture Documentation (`docs/DATABASE.md`)](docs/DATABASE.md)
+- [Payment Gateway & OTP Integration Architecture (`docs/PAYMENT.md`)](docs/PAYMENT.md)
 - [API Contract Specification (`docs/API_CONTRACT.md`)](docs/API_CONTRACT.md)
