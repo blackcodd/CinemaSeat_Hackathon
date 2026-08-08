@@ -1,154 +1,264 @@
 # 🎬 CinemaSeat — Production Microservices Cinema Ticketing System
 
-[![CI Pipeline](https://github.com/blackcodd/CinemaSeat_Hackathon/actions/workflows/ci.yml/badge.svg)](https://github.com/blackcodd/CinemaSeat_Hackathon/actions/workflows/ci.yml)
-**Built for Zero to Production Phase 2 Hackathon (IEEE CS CUET · Powered by Poridhi.io)**
+[![CI Pipeline](https://github.com/blackcodd/CinemaSeat_Hackathon/actions/workflows/main.yml/badge.svg)](https://github.com/blackcodd/CinemaSeat_Hackathon/actions/workflows/main.yml)
+**Official Submission for Zero to Production Phase 2 Hackathon (IEEE CS CUET · Powered by Poridhi.io)**
 
-Zero-Oversell Cinema Booking Engine powered by **Redis Distributed Locks (`SET NX EX`)**, **PostgreSQL Partial Unique Indexing**, **Asynchronous Redis Queue Workers**, and **Realtime WebSockets**.
+A zero-oversell, high-concurrency cinema booking microservice stack built with **Next.js 14**, **Express.js**, **Redis 7 (Distributed Locks & Event Queues)**, **PostgreSQL 16 (ACID & Partial Unique Indexing)**, **Asynchronous Background Workers**, and **Payment Gateway Integration**.
 
 ---
 
-## 🏛️ System Architecture
+## 🌐 Live Production Deployment
+
+| Service | Public URL / Endpoint | Status |
+| :--- | :--- | :---: |
+| 🎨 **Web Application (Frontend)** | [http://13.251.106.104:3000](http://13.251.106.104:3000) | 🟢 LIVE |
+| ⚡ **API Gateway Health Check** | [http://13.251.106.104:4000/health](http://13.251.106.104:4000/health) | 🟢 200 OK (<1ms) |
+| 🎬 **Movies Catalogue API** | [http://13.251.106.104:4000/movies](http://13.251.106.104:4000/movies) | 🟢 LIVE |
+| 🎟️ **Showtime Seatmap API** | `http://13.251.106.104:4000/showtimes/66666666-6666-4666-8666-666666666666/seats` | 🟢 LIVE |
+
+---
+
+## 📋 Requirement Specifications
+
+Below is the matrix mapping official **Zero to Production Phase 2 Hackathon Rulebook** specifications to implementation details:
 
 ```text
-                               ┌───────────────────────────┐
-                               │     Nginx API Gateway     │
-                               │        (Port 8888)        │
-                               └─────────────┬─────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                                HACKATHON REQUIREMENT MATRIX                             │
+├────────────────────────────┬──────────────────────────────────┬─────────────────────────┤
+│ Requirement                │ Specification                    │ CinemaSeat Solution     │
+├────────────────────────────┼──────────────────────────────────┼─────────────────────────┤
+│ 1. Zero Oversell           │ Max 1 hold/confirmation per seat │ Redis SET NX EX +       │
+│                            │ under 100 concurrent requests.   │ DB Partial Unique Index │
+├────────────────────────────┼──────────────────────────────────┼─────────────────────────┤
+│ 2. Independent Health Check│ GET /health returns 200 OK <10ms │ Express in-memory check │
+│                            │ without external dependencies.   │ (Response time <1ms)    │
+├────────────────────────────┼──────────────────────────────────┼─────────────────────────┤
+│ 3. Configurable Hold TTL   │ Hold expires automatically after │ Env variable            │
+│                            │ configurable duration.           │ HOLD_TTL_SECONDS=300    │
+├────────────────────────────┼──────────────────────────────────┼─────────────────────────┤
+│ 4. Microservice Boundaries │ Decoupled components with clear  │ 7 isolated containers   │
+│                            │ execution limits.                │ in docker-compose.yml   │
+├────────────────────────────┼──────────────────────────────────┼─────────────────────────┤
+│ 5. HMAC & Security         │ Secure gateway callback ACK and  │ HMAC SHA-256 signature  │
+│                            │ deterministic OTP mode.          │ key: z2p-2026-secret    │
+├────────────────────────────┼──────────────────────────────────┼─────────────────────────┤
+│ 6. Automated Testing       │ Concurrency & system test suite  │ Node.js automated test  │
+│                            │ in CI pipeline.                  │ test_suite.js (9/9 pass)│
+└────────────────────────────┴──────────────────────────────────┴─────────────────────────┘
+```
+
+---
+
+## 🏛️ Overall System Architecture (Overview)
+
+High-level request routing and container isolation layout:
+
+```text
+ ┌────────────────────────────────────────────────────────────────────────────────────────┐
+ │                                   CLIENT & BROWSER LAYERS                              │
+ └───────────────────────────────────────────┬────────────────────────────────────────────┘
                                              │
-                      ┌──────────────────────┴──────────────────────┐
-                      ▼                                             ▼
-       ┌──────────────────────────────┐              ┌──────────────────────────────┐
-       │     Next.js Web Frontend     │              │      Express API Service     │
-       │         (Port 3000)          │              │         (Port 4000)          │
-       └──────────────────────────────┘              └──────────────┬───────────────┘
-                                                                    │
-                                                ┌───────────────────┼───────────────────┐
-                                                ▼                   ▼                   ▼
-                                       ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
-                                       │  PostgreSQL 16  │ │  Redis 7 Engine │ │ Mock Gateway    │
-                                       │   (Port 5432)   │ │   (Port 6380)   │ │  (Port 9000)    │
-                                       └────────▲────────┘ └────────┬────────┘ └────────┬────────┘
-                                                │                   │                   │
-                                                │                   ▼                   │
-                                                │         ┌───────────────────┐         │
-                                                └─────────┤   Worker Service  │◄────────┘ (webhooks)
-                                                          │ (Async Event Queue)│
-                                                          └───────────────────┘
-```
-
-### Microservice Boundaries & Responsibilities:
-1. **`api-service` (Port 4000)**: Express REST API & WebSocket Server (`/ws/showtimes/:id`). Serves `/health`, `/metrics`, movie/seat map endpoints, Redis lock acquisition, and fast `<10ms` HMAC webhook ACK.
-2. **`worker-service`**: Asynchronous Redis Queue consumer. Dequeues payment webhooks (`webhook:events`) to execute atomic PostgreSQL state transitions (`CONFIRMED`, `FAILED`, `REFUNDED`) and streams updates over Pub/Sub.
-3. **`redis` (Port 6380 / Internal 6379)**: Multi-purpose event bus providing memory-level locking (`SET NX EX`), seat hold TTLs, event queuing, and Pub/Sub broadcasting.
-4. **`postgres` (Port 5432)**: ACID source of truth. Features partial unique index `one_active_holder_per_seat` preventing data-level oversell.
-5. **`nginx` (Port 8888)**: API Gateway proxying `/api` & `/ws` to `api-service`, and `/` to `frontend`.
-6. **`frontend` (Port 3000)**: Next.js App Router SVG seat map with WebSocket status syncing & 5-minute countdown ring.
-7. **`gateway` (Port 9000)**: `asifmahmoud414/mock-gateway:latest` mock payment & OTP provider with deliberate network delays, failure rates, and duplicate callbacks.
-
----
-
-## 📋 Engineering Expectations & Scoring Checklist (100/100)
-
-| Criterion | Weight | CinemaSeat Implementation | Status |
-| :--- | :---: | :--- | :---: |
-| **System Architecture & Design** | 25 | Decoupled 7-container microservices, Redis distributed locks, Partial Unique Index DB defense, ADRs in `DECISIONS.md`. | ✅ PASS |
-| **Functionality & Completeness** | 25 | Full end-to-end user flow: Browsing -> Selection -> Hold Countdown -> Email OTP -> Gateway Payment -> Async Webhook ACK -> Ticket Confirmation. | ✅ PASS |
-| **Code Quality & Testing** | 15 | Modular Node.js/Next.js code, structured JSON logging (`requestId`, `durationMs`), `.env.example`, automated high-concurrency test suite (`test_suite.js`). | ✅ PASS |
-| **Containerization & CI** | 15 | Single-command root `docker-compose.yml`, Dockerfiles per service, GitHub Actions workflow `.github/workflows/ci.yml`. | ✅ PASS |
-| **Deployment & Production Readiness** | 10 | Independent `/health` check in `<1ms`, zero host port collisions, containerized and ready for Poridhi VM / AWS deployment. | ✅ PASS |
-| **Documentation** | 5 | Architectural diagram, Zero-step setup guide, Copy-paste `curl` judge hooks, ADRs in `DECISIONS.md`. | ✅ PASS |
-| **Presentation & Defence** | 5 | Comprehensive Q&A defence guide prepared for judge panel evaluation. | ✅ PASS |
-
----
-
-## ⚖️ Non-Negotiable Judging Hooks
-
-### 1. Independent Health Check (`GET /health`)
-Returns `200 OK` in `< 1ms` from memory, independently of gateway container status:
-```bash
-curl -i http://localhost:4000/health
-```
-**Response (`200 OK`):**
-```json
-{
-  "status": "ok",
-  "timestamp": "2026-08-08T14:39:00.000Z"
-}
-```
-
-### 2. Configurable Hold Expiry (`HOLD_TTL_SECONDS`)
-Configured via `.env` / `docker-compose.yml` (`HOLD_TTL_SECONDS=300`). Redis keys expire automatically after 5 minutes without cron sweepers.
-
-### 3. Exact Required API Requests (Copy-Paste `curl` Examples)
-
-#### A. Fetch Seat Map (`GET /showtimes/:id/seats`)
-```bash
-curl -i http://localhost:4000/showtimes/66666666-6666-4666-8666-666666666666/seats
-```
-
-#### B. Hold a Seat (`POST /bookings/hold`)
-```bash
-curl -i -X POST http://localhost:4000/bookings/hold \
-  -H "Content-Type: application/json" \
-  -d '{
-    "showtime_id": "66666666-6666-4666-8666-666666666666",
-    "seat_id": "99999999-9999-4999-8999-999999999991"
-  }'
-```
-
-#### C. Gateway Smoke Test & Webhook Verification
-```bash
-curl -s -X POST http://localhost:9000/charge \
-  -H 'Content-Type: application/json' \
-  -H 'X-Mock-Mode: deterministic' \
-  -d '{"amount":450,"currency":"BDT","booking_ref":"bk_test","callback_url":"http://api-service:4000/webhooks/payment"}'
-
-sleep 4
-curl -s "http://localhost:9000/debug/deliveries?booking_ref=bk_test"
-```
-**Response (`http_status: 200`, `ok: true`):**
-```json
-{"count":1,"deliveries":[{"at":"2026-08-08T08:55:04.903Z","type":"payment","event_id":"evt_cc84c4231cc1be8f","payment_id":"pay_5e0e56405e017fd3","booking_ref":"bk_test","status":"SUCCEEDED","attempt":1,"url":"http://api-service:4000/webhooks/payment","http_status":200,"ok":true}]}
+                                   HTTP / WebSockets (3000 / 4000)
+                                             │
+ ┌───────────────────────────────────────────▼────────────────────────────────────────────┐
+ │                              NGINX REVERSE PROXY / GATEWAY                             │
+ └─────────────────────┬─────────────────────────────────────────────┬────────────────────┘
+                       │                                             │
+            ┌──────────▼───────────┐                      ┌──────────▼───────────┐
+            │ Next.js Web Frontend │                      │  Express API Service │
+            │      (Port 3000)     │                      │      (Port 4000)     │
+            └──────────────────────┘                      └──────────┬───────────┘
+                                                                     │
+                                            ┌────────────────────────┼────────────────────────┐
+                                            ▼                        ▼                        ▼
+                                   ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+                                   │  PostgreSQL 16  │      │  Redis 7 Engine │      │  Mock Gateway   │
+                                   │  (Port 5432)    │      │   (Port 6380)   │      │   (Port 9000)   │
+                                   └────────▲────────┘      └────────┬────────┘      └────────┬────────┘
+                                            │                        │                        │
+                                            │                 Redis Event Queue               │
+                                            │                        │                        │
+                                            │             ┌──────────▼──────────┐             │
+                                            └─────────────┤ Async Worker Engine │◄────────────┘ (Webhooks)
+                                                          │  (State Transition) │
+                                                          └─────────────────────┘
 ```
 
 ---
 
-## 🚀 Zero-Step Clean Clone Launch (`docker compose up`)
+## 📐 System Architecture (Details)
 
+```mermaid
+flowchart TD
+    subgraph ClientLayer ["Client Layer"]
+        User["🌐 User Browser / Client"]
+    end
+
+    subgraph ContainerStack ["Docker Microservices Stack"]
+        NGINX["⚡ Nginx Proxy (Port 8888 / 80)"]
+        FRONTEND["🎨 Next.js 14 Frontend (Port 3000)"]
+        API["⚙️ Express API Service (Port 4000)"]
+        WORKER["🔄 Async Queue Worker (Background)"]
+        REDIS[("⚡ Redis 7 Cache & Pub/Sub (Port 6380)")]
+        PG[("🐘 PostgreSQL 16 DB (Port 5432)")]
+        GATEWAY["💳 Mock Payment Gateway (Port 9000)"]
+    end
+
+    User -->|HTTP Requests| NGINX
+    User -->|Direct Port 3000| FRONTEND
+    User -->|Direct Port 4000| API
+
+    NGINX -->|/| FRONTEND
+    NGINX -->|/api| API
+
+    API -->|1. Acquire SET NX EX Lock| REDIS
+    API -->|2. Save HELD Booking| PG
+    API -->|3. Trigger Charge / OTP| GATEWAY
+
+    GATEWAY -->|Async Webhook Callback| API
+    API -->|Push Event to Queue| REDIS
+    WORKER -->|Pop Webhook Payload| REDIS
+    WORKER -->|Atomic State Update CONFIRMED/FAILED| PG
+    WORKER -->|Broadcast Realtime Seat Update| REDIS
+```
+
+### Microservice Container Breakdown:
+1. **`api-service` (Port 4000)**: Express REST API & WebSocket Server (`/ws/showtimes/:id`). Serves `/health`, movie catalog, seat map, acquires Redis memory locks, and returns `<10ms` HMAC Webhook ACKs.
+2. **`worker-service`**: Background event processor consuming Redis `webhook:events` queue. Performs transactional database state updates (`CONFIRMED`, `FAILED`) and broadcasts WS status changes.
+3. **`redis` (Port 6380)**: Sub-millisecond distributed locker (`SET NX EX`), seat hold TTL manager (5 minutes), event broker, and realtime WebSocket Pub/Sub channel.
+4. **`postgres` (Port 5432)**: Relational ACID source of truth enforcing strict uniqueness constraints via partial unique index `one_active_holder_per_seat`.
+5. **`frontend` (Port 3000)**: Modern Next.js 14 Standalone UI with interactive SVG seat map, live WS updates, hold countdown timer, and seamless OTP payment workflow.
+6. **`nginx` (Port 8888 / 80)**: Production edge reverse proxy.
+7. **`gateway` (Port 9000)**: Hackathon Mock Gateway (`asifmahmoud414/mock-gateway:latest`) handling OTP generation & payment processing.
+
+---
+
+## 🗄️ Database Schema & Constraints
+
+```text
+ ┌───────────────────┐       ┌───────────────────┐       ┌───────────────────┐
+ │      movies       │       │     theatres      │       │      screens      │
+ ├───────────────────┤       ├───────────────────┤       ├───────────────────┤
+ │ id (UUID)         │◄──────│ id (UUID)         │       │ id (UUID)         │
+ │ title (TEXT)      │       │ name (TEXT)       │◄──────│ theatre_id (UUID) │
+ │ poster_url (TEXT) │       │ address (TEXT)    │       │ name (TEXT)       │
+ └─────────┬─────────┘       └───────────────────┘       └─────────┬─────────┘
+           │                                                       │
+           └───────────────────────────┬───────────────────────────┘
+                                       ▼
+                             ┌───────────────────┐
+                             │     showtimes     │
+                             ├───────────────────┤
+                             │ id (UUID)         │
+                             │ movie_id (UUID)   │
+                             │ screen_id (UUID)  │
+                             │ starts_at (TSTZ)  │
+                             └─────────┬─────────┘
+                                       │
+            ┌──────────────────────────┴──────────────────────────┐
+            ▼                                                     ▼
+ ┌───────────────────┐                                 ┌───────────────────┐
+ │       seats       │                                 │    seat_status    │
+ ├───────────────────┤                                 ├───────────────────┤
+ │ id (UUID)         │                                 │ showtime_id (UUID)│
+ │ screen_id (UUID)  │                                 │ seat_id (UUID)    │
+ │ row_label (TEXT)  │                                 │ status (AVAILABLE/│
+ │ seat_number (INT) │                                 │   HELD/CONFIRMED) │
+ └─────────┬─────────┘                                 │ held_by_ref (TEXT)│
+           │                                           └───────────────────┘
+           └───────────────────────────┬───────────────────────────┘
+                                       ▼
+                             ┌───────────────────┐
+                             │     bookings      │
+                             ├───────────────────┤
+                             │ booking_ref (PK)  │
+                             │ showtime_id (UUID)│
+                             │ seat_id (UUID)    │
+                             │ status (TEXT)     │
+                             │ amount (NUMERIC)  │
+                             └───────────────────┘
+```
+
+### Critical Defensive Index (Oversell Safeguard):
+```sql
+CREATE UNIQUE INDEX one_active_holder_per_seat 
+ON seat_status (showtime_id, seat_id) 
+WHERE status IN ('HELD', 'CONFIRMED');
+```
+*Guarantees that even if Redis memory locking were bypassed, PostgreSQL rejects dual holds with `23505 unique_violation`.*
+
+---
+
+## 🔒 Integration & Security Specifications
+
+### 1. Webhook HMAC SHA-256 Verification
+Incoming gateway webhooks are authenticated via HMAC SHA-256 signature validation:
+```javascript
+const expectedSignature = crypto
+  .createHmac('sha256', process.env.GATEWAY_SECRET || 'z2p-2026-secret')
+  .update(rawBody)
+  .digest('hex');
+```
+
+### 2. Idempotent Processing
+Duplicate payment callbacks are handled idempotently via PostgreSQL `processed_webhook_events`:
+```sql
+INSERT INTO processed_webhook_events (event_id) 
+VALUES ($1) ON CONFLICT (event_id) DO NOTHING;
+```
+
+---
+
+## 🚀 Deployment & Local Setup
+
+### 1. Production Server Details (AWS EC2)
+- **Instance Type**: AWS `t2.micro` (1 vCPU, 1 GB RAM)
+- **Swap Memory**: 2 GB `/swapfile` enabled for build stability
+- **Build Mode**: Next.js `output: 'standalone'` for minimum disk footprint
+
+### 2. Run Local Production Stack (Single Command)
 ```bash
 git clone https://github.com/blackcodd/CinemaSeat_Hackathon.git
 cd CinemaSeat_Hackathon
-docker compose up --build
+docker compose up -d --build
 ```
-Automatically initializes schema, seeds fictional movies/showtimes/seats, starts Redis, Postgres, API service, Worker service, Frontend, and Nginx.
 
-To run the automated test suite locally:
+### 3. Run Automated Concurrency Test Suite
 ```bash
-node backend/src/tests/test_suite.js
+cd backend
+node src/tests/test_suite.js
 ```
 
 ---
 
-## 📊 Concurrency & Load Test Results
+## 📊 Test Suite Execution Summary (9/9 PASSED)
 
-- **Scenario A (100 Concurrent Holds on 1 Seat):** 100 requests fired simultaneously using `Promise.all` -> **1 Succeeded (200 OK), 99 Rejected (409 Conflict)**, 0 Oversell.
-- **Partial Unique Index Test:** Direct database insert bypassing Redis rejected with PostgreSQL `23505 unique_violation`.
-- **Webhook Idempotency:** Duplicate payment webhooks processed idempotently with `200 OK` both times.
+```text
+==============================================
+  STARTING MICROSERVICES SUITE (SCENARIOS A/B/C)
+==============================================
+
+[PASS] HOOK 1: GET /health returns 200 OK
+[PASS] GET /movies returns >= 3 fictional movies
+[PASS] GET /showtimes/:id/seats returns 32 seat grid
+
+--- Running Scenario A: 100 Concurrent Holds on 1 Seat ---
+[PASS] Exact 1 request succeeded (Got: 1)
+[PASS] Exact 99 requests rejected with 409 Conflict (Got: 99)
+[PASS] Seat status in PostgreSQL seat_status is HELD
+
+--- Running Partial Unique Index Direct DB Bypass Test ---
+[PASS] Partial Unique Index (one_active_holder_per_seat) rejected direct DB bypass
+
+--- Running Webhook Ingestion & Idempotency Test ---
+[PASS] POST /webhooks/payment accepts valid payload and ACKs in <10ms
+[PASS] POST /webhooks/payment handles duplicate event_id idempotently (returns 200 OK)
+
+==============================================
+ TEST SUMMARY: 9 PASSED | 0 FAILED
+==============================================
+```
 
 ---
-
-## 🎤 Presentation & Defence Q&A Guide for Judges
-
-1. **Why did you draw your service boundaries between `api-service` and `worker-service`?**
-   - *Answer*: To protect the front-facing HTTP and WebSocket performance. `api-service` must answer user holds and webhook ACKs in under 10ms. Heavy database transactions, state reconciliation, and retry loops are delegated to `worker-service` consuming from a Redis queue.
-2. **How do you prevent overselling under 100 concurrent requests?**
-   - *Answer*: We use a 2-tier arbiter. First, Redis `SET NX EX` memory locking rejects conflicting requests in sub-milliseconds before touching the DB. Second, PostgreSQL has a partial unique index `WHERE status IN ('HELD','CONFIRMED')` guaranteeing ACID uniqueness at the database level.
-3. **How do you handle duplicate webhooks from an unreliable gateway?**
-   - *Answer*: We store received `event_id`s in `processed_webhook_events` with `ON CONFLICT DO NOTHING`. If a duplicate arrives, `api-service` instantly returns `200 OK` (to satisfy Gateway Rule 1) and quietly discards the payload.
-4. **What breaks first under extreme traffic load?**
-   - *Answer*: The PostgreSQL connection pool. However, because Redis locks absorb 99% of conflicting hold bursts in memory, PostgreSQL only receives 1 query per successful seat hold, drastically reducing database load.
-
----
-
-## 🧠 Architectural Decisions
-See [DECISIONS.md](DECISIONS.md) for full Architectural Decision Records (ADRs).
+**Built with ❤️ for Zero to Production Phase 2 Hackathon 2026**
