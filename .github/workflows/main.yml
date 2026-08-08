@@ -1,0 +1,100 @@
+name: CinemaSeat Production CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test-and-verify:
+    name: Concurrency & System Reliability Tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: cinemaseat_user
+          POSTGRES_PASSWORD: cinemaseat_password
+          POSTGRES_DB: cinemaseat
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cinemaseat_user -d cinemaseat"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js Environment
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install Dependencies
+        run: |
+          cd backend
+          npm ci
+
+      - name: Run Schema Migration
+        env:
+          PGHOST: localhost
+          PGPORT: 5432
+          PGUSER: cinemaseat_user
+          PGPASSWORD: cinemaseat_password
+          PGDATABASE: cinemaseat
+        run: |
+          PGPASSWORD=cinemaseat_password psql -h localhost -U cinemaseat_user -d cinemaseat -f backend/src/db/schema.sql
+
+      - name: Execute Automated Test Suite (Zero-Oversell & Concurrency Check)
+        env:
+          PGHOST: localhost
+          PGPORT: 5432
+          PGUSER: cinemaseat_user
+          PGPASSWORD: cinemaseat_password
+          PGDATABASE: cinemaseat
+          REDIS_URL: redis://localhost:6379
+          GATEWAY_SECRET: z2p-2026-secret
+        run: |
+          node backend/src/tests/test_suite.js
+
+  deploy-to-production:
+    name: Continuous Deployment (CD) to EC2
+    needs: test-and-verify
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Deploy to AWS EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.0
+        if: env.EC2_HOST != ''
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd ~/CinemaSeat_Hackathon
+            git pull origin main
+            sudo docker compose up -d --build
+
