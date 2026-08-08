@@ -52,6 +52,10 @@ jobs:
           cd backend
           npm ci
 
+      - name: Install PostgreSQL Client
+        run: |
+          sudo apt-get update && sudo apt-get install -y postgresql-client
+
       - name: Run Schema Migration
         env:
           PGHOST: localhost
@@ -97,4 +101,3 @@ jobs:
             cd ~/CinemaSeat_Hackathon
             git pull origin main
             sudo docker compose up -d --build
-
