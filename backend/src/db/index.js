@@ -20,6 +20,14 @@ async function initDb() {
   const schemaPath = path.join(__dirname, 'schema.sql');
   const schemaSql = fs.readFileSync(schemaPath, 'utf8');
   await pool.query(schemaSql);
+  await pool.query('TRUNCATE TABLE payments, processed_webhook_events, otp_verifications, bookings CASCADE;');
+  await pool.query("UPDATE seat_status SET status = 'AVAILABLE', held_by_booking_ref = NULL, hold_expires_at = NULL;");
+  try {
+    const { flushRedisLocks } = require('../lib/redis');
+    await flushRedisLocks();
+  } catch (e) {
+    // ignore if redis unavailable during schema init
+  }
   await seedDb();
 }
 

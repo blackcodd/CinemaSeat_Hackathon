@@ -1,5 +1,5 @@
 process.env.NODE_ENV = 'test';
-process.env.GATEWAY_SECRET = 'hackathon-secret-key';
+process.env.GATEWAY_SECRET = 'z2p-2026-secret';
 process.env.HOLD_TTL_SECONDS = '300';
 
 const http = require('http');
@@ -77,7 +77,7 @@ async function runTests() {
 
     // TEST 1: GET /health (Hook 1)
     const health = await request('GET', '/health');
-    await assert(health.status === 200 && health.body.status === 'ok', 'HOOK 1: GET /health returns 200 OK');
+    await assert(health.status === 200 && health.body && health.body.status === 'ok', 'HOOK 1: GET /health returns 200 OK');
 
     // TEST 2: GET /movies
     const movies = await request('GET', '/movies');
@@ -125,10 +125,24 @@ async function runTests() {
     }
     await assert(directInsertFailed, 'Partial Unique Index (one_active_holder_per_seat) rejected direct DB bypass insert with 23505 unique violation');
 
-    // TEST 6: WEBHOOK IDEMPOTENCY & HMAC SIGNATURE
-    console.log('\n--- Running Webhook Ingestion & Idempotency Test ---');
-    const bookingRef = results.find((r) => r.status === 200).body.booking_ref;
+    // TEST 6: OTP SEND & VERIFY TEST
+    console.log('\n--- Running OTP Send & Verify Test ---');
+    const successfulBooking = results.find((r) => r.status === 200 && r.body && r.body.booking_ref);
+    const bookingRef = successfulBooking ? successfulBooking.body.booking_ref : 'REF-FALLBACK';
 
+    const otpSendRes = await request('POST', `/bookings/${bookingRef}/otp/send`, { phone: '01700000000' }, { 'X-Mock-Mode': 'deterministic' });
+    await assert(otpSendRes.status === 200 || otpSendRes.status === 202, 'POST /bookings/:ref/otp/send initiates OTP delivery');
+
+    const otpVerifyRes = await request('POST', `/bookings/${bookingRef}/otp/verify`, { code: '123456' });
+    await assert(otpVerifyRes.status === 200 && otpVerifyRes.body && otpVerifyRes.body.verified === true, 'POST /bookings/:ref/otp/verify validates code 123456 in deterministic mode');
+
+    // TEST 7: PAYMENT INITIATION WITH IDEMPOTENCY KEY
+    console.log('\n--- Running Payment Initiation & Idempotency Test ---');
+    const payRes = await request('POST', `/bookings/${bookingRef}/pay`, { phone: '01700000000', amount: 400 }, { 'X-Mock-Mode': 'deterministic' });
+    await assert(payRes.status === 200 || payRes.status === 202, 'POST /bookings/:ref/pay returns 202/200 PENDING status');
+
+    // TEST 8: WEBHOOK IDEMPOTENCY & HMAC SIGNATURE
+    console.log('\n--- Running Webhook Ingestion & HMAC Verification ---');
     const webhookPayload = JSON.stringify({
       event_id: 'evt_test_microservice_100',
       payment_id: `PAY-${bookingRef}`,

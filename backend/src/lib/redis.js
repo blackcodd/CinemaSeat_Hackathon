@@ -63,12 +63,20 @@ async function publishSeatUpdate(showtimeId, updateData) {
   await pubClient.publish(channel, JSON.stringify(updateData));
 }
 
+async function flushRedisLocks() {
+  const keys = await redis.keys('seat:hold:*');
+  if (keys.length > 0) {
+    await redis.del(...keys);
+  }
+}
+
 module.exports = {
   redis,
   pubClient,
   subClient,
   tryAcquireSeatHold,
   releaseSeatHold,
+  flushRedisLocks,
   enqueueWebhookEvent,
   dequeueWebhookEvent,
   publishSeatUpdate,
