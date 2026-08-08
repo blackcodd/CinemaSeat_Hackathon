@@ -232,6 +232,22 @@ node src/tests/test_suite.js
 
 ---
 
+## 🔄 Continuous Integration & Deployment (CI/CD Pipeline)
+
+The repository enforces production readiness via GitHub Actions (`.github/workflows/main.yml`):
+
+1. **Concurrency & System Reliability Job**:
+   - Automated postgres:16 and redis:7 container provisioning.
+   - Database schema migration & seed execution.
+   - Runs `test_suite.js` (Scenario A 100 concurrent holds, DB bypass prevention, HMAC webhook ACK & idempotency).
+2. **Continuous Deployment (CD) Job**:
+   - Triggers automatically upon successful test completion on branch `main`.
+   - Connects to AWS EC2 via SSH (`appleboy/ssh-action`).
+   - Pulls latest main branch code and triggers `docker compose up -d --build`.
+
+
+---
+
 ## 📊 Test Suite Execution Summary (9/9 PASSED)
 
 ```text
