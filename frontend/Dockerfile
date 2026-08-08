@@ -8,7 +8,9 @@ RUN npm install
 
 COPY . .
 
-RUN npm run build
+ENV NODE_OPTIONS="--max-old-space-size=512"
+
+RUN npm run build && rm -rf .next/cache
 
 EXPOSE 3000
 
