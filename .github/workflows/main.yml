@@ -15,13 +15,13 @@ jobs:
       postgres:
         image: postgres:16-alpine
         env:
-          POSTGRES_USER: cinemaseat_user
-          POSTGRES_PASSWORD: cinemaseat_password
+          POSTGRES_USER: cinemaseat
+          POSTGRES_PASSWORD: cinemaseat
           POSTGRES_DB: cinemaseat
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U cinemaseat_user -d cinemaseat"
+          --health-cmd "pg_isready -U cinemaseat -d cinemaseat"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 5
@@ -52,27 +52,32 @@ jobs:
           cd backend
           npm ci
 
+      - name: Install PostgreSQL Client
+        run: |
+          sudo apt-get update && sudo apt-get install -y postgresql-client
+
       - name: Run Schema Migration
         env:
           PGHOST: localhost
           PGPORT: 5432
-          PGUSER: cinemaseat_user
-          PGPASSWORD: cinemaseat_password
+          PGUSER: cinemaseat
+          PGPASSWORD: cinemaseat
           PGDATABASE: cinemaseat
         run: |
-          PGPASSWORD=cinemaseat_password psql -h localhost -U cinemaseat_user -d cinemaseat -f backend/src/db/schema.sql
+          PGPASSWORD=cinemaseat psql -h localhost -U cinemaseat -d cinemaseat -f backend/src/db/schema.sql
 
       - name: Execute Automated Test Suite (Zero-Oversell & Concurrency Check)
         env:
           PGHOST: localhost
           PGPORT: 5432
-          PGUSER: cinemaseat_user
-          PGPASSWORD: cinemaseat_password
+          PGUSER: cinemaseat
+          PGPASSWORD: cinemaseat
           PGDATABASE: cinemaseat
           REDIS_URL: redis://localhost:6379
           GATEWAY_SECRET: z2p-2026-secret
         run: |
-          node backend/src/tests/test_suite.js
+          cd backend
+          node src/tests/test_suite.js
 
   deploy-to-production:
     name: Continuous Deployment (CD) to EC2
@@ -97,4 +102,3 @@ jobs:
             cd ~/CinemaSeat_Hackathon
             git pull origin main
             sudo docker compose up -d --build
-
