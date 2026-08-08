@@ -76,7 +76,8 @@ jobs:
           REDIS_URL: redis://localhost:6379
           GATEWAY_SECRET: z2p-2026-secret
         run: |
-          node backend/src/tests/test_suite.js
+          cd backend
+          node src/tests/test_suite.js
 
   deploy-to-production:
     name: Continuous Deployment (CD) to EC2
