@@ -1,0 +1,38 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: cinemaseat
+      POSTGRES_PASSWORD: cinemaseat
+      POSTGRES_DB: cinemaseat
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+ 
+  gateway:
+    image: asifmahmoud414/mock-gateway:latest
+    ports:
+      - "9000:9000"
+ 
+  backend:
+    build: ./backend
+    ports:
+      - "4000:4000"
+    environment:
+      DATABASE_URL: postgres://cinemaseat:cinemaseat@postgres:5432/cinemaseat
+      HOLD_TTL_SECONDS: 60
+      GATEWAY_URL: http://gateway:9000
+    depends_on:
+      - postgres
+      - gateway
+ 
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+ 
+volumes:
+  pgdata:
