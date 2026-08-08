@@ -180,7 +180,7 @@
     /* MOVIES GRID */
     .movies-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
       gap: 2rem;
       margin-top: 2rem;
     }
@@ -188,7 +188,7 @@
     .movie-card {
       background: var(--card-bg);
       border: 1px solid var(--card-border);
-      border-radius: 16px;
+      border-radius: 18px;
       overflow: hidden;
       transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
       display: flex;
@@ -198,12 +198,12 @@
     .movie-card:hover {
       transform: translateY(-8px);
       border-color: rgba(56, 189, 248, 0.4);
-      box-shadow: 0 15px 35px rgba(0, 0, 0, 0.6);
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6);
     }
     .movie-poster-wrap {
       position: relative;
       width: 100%;
-      height: 340px;
+      height: 380px;
       background: #1e293b;
       overflow: hidden;
     }
@@ -213,17 +213,21 @@
       object-fit: cover;
       transition: transform 0.4s ease;
     }
-    .movie-card:hover .movie-poster { transform: scale(1.05); }
+    .movie-card:hover .movie-poster { transform: scale(1.06); }
 
-    .poster-placeholder {
-      width: 100%;
-      height: 100%;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      background: linear-gradient(135deg, #1e293b, #0f172a);
-      font-size: 4rem;
+    .movie-badge-premiere {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      background: rgba(239, 68, 68, 0.9);
+      color: #fff;
+      font-size: 0.75rem;
+      font-weight: 800;
+      padding: 0.3rem 0.75rem;
+      border-radius: 9999px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      box-shadow: 0 4px 10px rgba(239, 68, 68, 0.4);
     }
 
     .movie-info {
@@ -234,9 +238,10 @@
       justify-content: space-between;
     }
     .movie-title {
-      font-size: 1.3rem;
+      font-size: 1.35rem;
       font-weight: 800;
       margin-bottom: 0.5rem;
+      line-height: 1.25;
     }
 
     /* SHOWTIMES LIST */
@@ -366,7 +371,7 @@
       transform: scale(1.12);
     }
 
-    /* COUNTDOWN TIMER BADGE & PROGRESS BAR */
+    /* COUNTDOWN TIMER BADGE */
     .timer-badge {
       background: rgba(245, 158, 11, 0.15);
       border: 1px solid var(--yellow-held);
@@ -470,7 +475,7 @@
     <section id="view-home" class="hero">
       <div class="badge-hero">Zero-Oversell High Concurrency Engine</div>
       <h1>High-Concurrency Cinema Reservations</h1>
-      <p>Experience zero oversell seat locks, idempotent gateway webhooks, and instant booking confirmations under heavy release traffic.</p>
+      <p>Experience zero oversell seat locks, idempotent gateway webhooks, and instant booking confirmations under heavy premiere release traffic.</p>
       <button class="btn-primary" onclick="navigateTo('movies')">Browse Movies & Select Seats</button>
     </section>
 
@@ -670,6 +675,13 @@
       ? 'http://localhost:4000'
       : '';
 
+    // Default High Quality Poster Art fallbacks
+    const posterArtMap = {
+      '1': 'https://images.unsplash.com/photo-1635805737707-575885ab0820?w=600&auto=format&fit=crop&q=80',
+      '2': 'https://images.unsplash.com/photo-1536440136628-849c177e76a1?w=600&auto=format&fit=crop&q=80',
+      '3': 'https://images.unsplash.com/photo-1509198397868-475647b2a1e5?w=600&auto=format&fit=crop&q=80'
+    };
+
     // Application Global State
     const state = {
       currentView: 'home',
@@ -711,20 +723,27 @@
         state.movies = movies;
         loading.classList.add('hidden');
 
-        grid.innerHTML = movies.map(m => `
-          <div class="movie-card">
-            <div class="movie-poster-wrap">
-              <div class="poster-placeholder">🍿</div>
-            </div>
-            <div class="movie-info">
-              <div>
-                <div class="movie-title">${m.title}</div>
-                <div style="color:var(--text-muted); font-size:0.85rem; margin-bottom:1rem;">2D / 3D • IMAX • Premiere</div>
+        grid.innerHTML = movies.map(m => {
+          const posterSrc = (m.poster_url && m.poster_url.startsWith('http')) 
+            ? m.poster_url 
+            : (posterArtMap[m.id] || 'https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?w=600&auto=format&fit=crop&q=80');
+
+          return `
+            <div class="movie-card">
+              <div class="movie-poster-wrap">
+                <span class="movie-badge-premiere">Premiere</span>
+                <img class="movie-poster" src="${posterSrc}" alt="${m.title}" loading="lazy" />
               </div>
-              <button class="btn-primary" style="width:100%;" onclick="selectMovie(${m.id})">View Showtimes</button>
+              <div class="movie-info">
+                <div>
+                  <div class="movie-title">${m.title}</div>
+                  <div style="color:var(--text-muted); font-size:0.85rem; margin-bottom:1rem;">2D / 3D • IMAX • Premiere</div>
+                </div>
+                <button class="btn-primary" style="width:100%;" onclick="selectMovie(${m.id})">View Showtimes</button>
+              </div>
             </div>
-          </div>
-        `).join('');
+          `;
+        }).join('');
       } catch (err) {
         loading.className = 'alert alert-danger';
         loading.innerHTML = 'Failed to load movies. Is backend server running?';
@@ -732,7 +751,7 @@
     }
 
     function selectMovie(movieId) {
-      state.selectedMovie = state.movies.find(m => m.id === movieId);
+      state.selectedMovie = state.movies.find(m => String(m.id) === String(movieId));
       document.getElementById('showtimes-movie-title').textContent = `${state.selectedMovie.title} - Select Showtime`;
       navigateTo('showtimes');
     }
@@ -751,17 +770,18 @@
         loading.classList.add('hidden');
 
         if (showtimes.length === 0) {
-          list.innerHTML = '<div class="alert alert-info">No showtimes currently scheduled.</div>';
+          list.innerHTML = '<div class="alert alert-info">No showtimes currently scheduled for this movie.</div>';
           return;
         }
 
         list.innerHTML = showtimes.map(s => {
           const date = new Date(s.start_time).toLocaleString();
+          const theatreName = s.theatre_id === 1 ? 'Star Cineplex - Bashundhara' : 'Blockbuster Cinemas - Jamuna';
           return `
             <div class="showtime-item">
               <div>
-                <strong style="font-size:1.15rem; color:#fff;">Star Cineplex (Theatre #${s.theatre_id})</strong>
-                <div style="color:var(--text-muted); font-size:0.9rem; margin-top:0.25rem;">${date}</div>
+                <strong style="font-size:1.15rem; color:#fff;">${theatreName}</strong>
+                <div style="color:var(--text-muted); font-size:0.9rem; margin-top:0.25rem;">🕒 ${date}</div>
               </div>
               <button class="btn-primary" onclick="selectShowtime(${s.id})">Select Seats</button>
             </div>
@@ -774,7 +794,7 @@
     }
 
     function selectShowtime(showtimeId) {
-      state.selectedShowtime = state.showtimes.find(s => s.id === showtimeId);
+      state.selectedShowtime = state.showtimes.find(s => String(s.id) === String(showtimeId));
       navigateTo('seats');
     }
 
