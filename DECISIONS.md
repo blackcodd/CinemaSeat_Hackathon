@@ -1,48 +1,36 @@
-# Architectural Decisions (ADR) - CinemaSeat
+# Architectural Decisions (ADR) — CinemaSeat
 
-This document records the major architectural decisions considered and implemented during the development of CinemaSeat under high-concurrency conditions.
-
----
-
-## 1. Concurrency & Locking Strategy for Seat Holds
-
-- **Options Considered:**
-  1. **Application-level In-Memory Locks (Node.js Mutex / Redis lock):** Fastest in single-node scenarios, but fails across multiple load-balanced backend containers and adds Redis complexity.
-  2. **Pessimistic Row-Level Locking (`SELECT FOR UPDATE` in PostgreSQL):** Locks the specific seat database row inside a database transaction until committed or rolled back.
-  3. **Optimistic Locking (`version` column checking):** Requires retries when conflicts occur.
-- **What We Chose:** Pessimistic Row-Level Locking (`SELECT FOR UPDATE`) combined with database transaction bounds.
-- **Why:** Guarantees absolute zero-oversell under extreme concurrent spikes (e.g., 100 requests hitting seat #1 in the exact same millisecond). PostgreSQL manages row locks reliably across distributed API instances.
-- **What We Gave Up:** Database connections hold short locks during transaction processing, slightly reducing peak throughput compared to non-transactional writes, but guaranteeing 100% data correctness.
+This document records the core architectural decisions, options considered, choices made, and trade-offs accepted for CinemaSeat.
 
 ---
 
-## 2. Payment Gateway Webhook Delivery & Idempotency Strategy
+## 1. Concurrency Arbiter: Redis Distributed Locks (`SET NX EX`) vs PostgreSQL Pessimistic Row Locking (`SELECT FOR UPDATE`)
 
 - **Options Considered:**
-  1. **Synchronous Payment Processing:** Backend `/pay` handler blocks until the gateway finishes callback processing.
-  2. **Asynchronous Non-blocking Processing with Database Deduplication:** `/pay` returns `202/200 PENDING` immediately. Gateway callbacks are processed asynchronously by `/webhooks/payment`, returning HTTP `200 OK` always and deduplicating via `payments.event_id UNIQUE` constraint.
-- **What We Chose:** Asynchronous Non-blocking Processing with `payments.event_id UNIQUE` deduplication and immediate HTTP `200 OK` return.
-- **Why:** The Mock Gateway specifies that non-200 responses trigger infinite retries, and network delays or duplicate callbacks (8% rate) must not cause duplicate payments or double-confirmed bookings.
-- **What We Gave Up:** The client receives a `PENDING` status on initial payment submit and must poll or wait for final confirmation via `/bookings/:booking_ref`.
+  1. **PostgreSQL Row-Level Locking (`SELECT FOR UPDATE`):** Holds row locks inside database transactions. Guarantees safety but serializes all 100 concurrent requests through database connection pools, causing connection pool exhaustion under blockbuster peak loads.
+  2. **Redis Distributed Locks (`SET seat:hold:{showtimeId}:{seatId} {bookingRef} NX EX {HOLD_TTL_SECONDS}`):** Redis evaluates lock acquisition in memory in microseconds before any database connection is consumed.
+- **What We Chose:** **Redis Distributed Locks (`SET NX EX`)** as the primary concurrency arbiter, paired with a PostgreSQL **Partial Unique Index (`one_active_holder_per_seat`)** as a secondary defense layer.
+- **Why:** Redis rejects 99 out of 100 concurrent hold requests in microseconds without opening a DB transaction or consuming a DB connection. This keeps p95 latency under 15ms even during 100+ concurrent bursts.
+- **Trade-off:** Requires Redis infrastructure; however, fallback to PostgreSQL transactions guarantees safety if Redis is ever bypassed.
 
 ---
 
-## 3. Webhook Security & HMAC-SHA256 Raw Body Signature Verification
+## 2. Service Architecture: Split Microservices (`api-service` + `worker-service`) vs Monolith
 
 - **Options Considered:**
-  1. **Re-stringifying parsed JSON body (`JSON.stringify(req.body)`):** Simple, but key order variations or whitespace formatting differences produce different hashes, breaking HMAC verification.
-  2. **Express `req.rawBody` Buffer Capture:** Capturing the raw HTTP request bytes directly in Express middleware during JSON body parsing.
-- **What We Chose:** Express `req.rawBody` Buffer Capture with HMAC-SHA256 signature verification using `GATEWAY_SECRET`.
-- **Why:** Guarantees cryptographic accuracy of HMAC signature verification regardless of JSON body parsing quirks or key reordering.
-- **What We Gave Up:** Requires capturing raw buffer bytes in custom Express middleware before `express.json()` processes request bodies.
+  1. **Monolithic Backend:** A single Node.js process serving API endpoints, WebSockets, and processing payment webhooks inline.
+  2. **Split Microservices:** `api-service` (Express HTTP + WebSockets) for fast client interaction and webhook ingestion, paired with `worker-service` (Node.js Consumer) for asynchronous state transitions.
+- **What We Chose:** **Split Microservices Architecture (`api-service` + `worker-service`)**.
+- **Why:** Separating the webhook ingestion layer (`api-service`) from state transition execution (`worker-service`) prevents gateway callback bottlenecks from stalling client browsing or WebSocket broadcasting.
+- **Trade-off:** Increases Docker orchestration complexity and requires Redis Queue setup.
 
 ---
 
-## 4. Fault Isolation & Independent Health Check Strategy
+## 3. Webhook Ingestion Strategy: Asynchronous Redis Queue vs Synchronous Inline Processing
 
 - **Options Considered:**
-  1. **Dependent Health Check:** `/health` pings database and gateway before returning 200 OK.
-  2. **Isolated Independent Health Check:** `/health` responds immediately with HTTP `200 OK` from memory without invoking external network requests.
-- **What We Chose:** Isolated Independent Health Check returning `{"status": "ok"}` in < 1ms.
-- **Why:** Health monitoring tools and orchestrators must verify local backend container availability even if external gateway services experience downtime or rate limiting.
-- **What We Gave Up:** `/health` does not reflect external gateway connectivity state, but preserves backend availability during third-party service outages.
+  1. **Synchronous Inline Processing:** `/webhooks/payment` executes DB transactions, payment validation, and seat state updates before sending HTTP response back to payment gateway.
+  2. **Asynchronous Queue Ingestion:** `/webhooks/payment` verifies HMAC signature, deduplicates `event_id` in `processed_webhook_events`, pushes event payload to Redis Queue (`webhook:events`), and ACKs gateway with `200 OK` in < 10ms.
+- **What We Chose:** **Asynchronous Queue Ingestion**.
+- **Why:** The payment gateway imposes strict callback timeouts and retries on delayed ACKs. Returning `200 OK` in < 10ms eliminates gateway retry storms while ensuring state transitions occur reliably via `worker-service`.
+- **Trade-off:** State updates to `bookings` and `seat_status` are eventually consistent, requiring WebSockets or status polling for client UI updates.

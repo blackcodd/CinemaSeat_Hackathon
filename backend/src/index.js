@@ -1,318 +1,369 @@
 const express = require('express');
 const cors = require('cors');
+const http = require('http');
 const crypto = require('crypto');
-require('dotenv').config();
-
-const { query, initDb } = require('./db');
-const { holdSeat } = require('./services/bookingService');
-const { startExpiryWorker } = require('./services/expiryWorker');
-const { sendOtp, verifyOtp } = require('./services/otpService');
-const { processPayment, handlePaymentWebhook, verifyWebhookSignature } = require('./services/paymentService');
+const { WebSocketServer } = require('ws');
+const { Redis } = require('ioredis');
+const { query } = require('./db');
+const bookingService = require('./services/bookingService');
+const { enqueueWebhookEvent } = require('./lib/redis');
 
 const app = express();
+const server = http.createServer(app);
+
+const PORT = process.env.PORT || 4000;
+const GATEWAY_SECRET = process.env.GATEWAY_SECRET || 'z2p-2026-secret';
+const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
+
+// Capture raw body for HMAC SHA-256 verification
+app.use(express.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf;
+  }
+}));
+
 app.use(cors());
 
-// Observability & Metrics State
-const metrics = {
-  totalRequests: 0,
-  successfulHolds: 0,
-  conflictedHolds: 0,
-  paymentsProcessed: 0,
-  startTime: Date.now(),
-};
-
-// Request ID & Structured Logging Middleware
+// Structured Request Logging Middleware
 app.use((req, res, next) => {
-  const requestId = req.headers['x-request-id'] || crypto.randomUUID();
-  req.requestId = requestId;
-  res.setHeader('X-Request-ID', requestId);
-  metrics.totalRequests++;
-
   const start = Date.now();
+  req.requestId = crypto.randomUUID();
   res.on('finish', () => {
     const duration = Date.now() - start;
-    console.log(
-      JSON.stringify({
+    if (req.path !== '/health') {
+      console.log(JSON.stringify({
         timestamp: new Date().toISOString(),
-        requestId,
+        requestId: req.requestId,
         method: req.method,
-        path: req.originalUrl,
+        path: req.path,
         status: res.statusCode,
         durationMs: duration,
-      })
-    );
+      }));
+    }
   });
   next();
 });
 
-// Express middleware capturing rawBody for HMAC-SHA256 signature verification
-app.use(
-  express.json({
-    verify: (req, res, buf) => {
-      req.rawBody = buf;
-    },
-  })
-);
+// WebSocket Server for Realtime Seat Map updates (/ws/showtimes/:id)
+const wss = new WebSocketServer({ noServer: true });
+const clientsByShowtime = new Map(); // showtimeId -> Set of ws clients
 
-/**
- * HOOK 1: GET /health
- * Must respond in under 1 second without depending on external services / mock gateway.
- */
-app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'ok' });
+server.on('upgrade', (request, socket, head) => {
+  const url = new URL(request.url, `http://${request.headers.host}`);
+  const match = url.pathname.match(/^\/ws\/showtimes\/([^/]+)$/);
+  if (match) {
+    const showtimeId = match[1];
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      ws.showtimeId = showtimeId;
+      wss.emit('connection', ws, request);
+    });
+  } else {
+    socket.destroy();
+  }
 });
 
-/**
- * BONUS: GET /metrics
- * Observability endpoint for system monitoring
- */
-app.get('/metrics', (req, res) => {
-  res.status(200).json({
-    status: 'ok',
-    uptimeSeconds: Math.floor((Date.now() - metrics.startTime) / 1000),
-    totalRequests: metrics.totalRequests,
-    successfulHolds: metrics.successfulHolds,
-    conflictedHolds: metrics.conflictedHolds,
-    paymentsProcessed: metrics.paymentsProcessed,
-    memoryUsageMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+wss.on('connection', (ws) => {
+  const showtimeId = ws.showtimeId;
+  if (!clientsByShowtime.has(showtimeId)) {
+    clientsByShowtime.set(showtimeId, new Set());
+  }
+  clientsByShowtime.get(showtimeId).add(ws);
+
+  // Send initial room membership viewer count
+  const viewerCount = clientsByShowtime.get(showtimeId).size;
+  ws.send(JSON.stringify({ type: 'VIEWER_COUNT', count: viewerCount }));
+
+  ws.on('close', () => {
+    if (clientsByShowtime.has(showtimeId)) {
+      clientsByShowtime.get(showtimeId).delete(ws);
+    }
   });
 });
 
+// Subscribe to Redis Pub/Sub for seat state updates and broadcast to WS clients
+const redisSub = new Redis(REDIS_URL);
+redisSub.psubscribe('showtime:*:seats', (err) => {
+  if (err) console.error('Redis PubSub subscribe error:', err);
+});
+
+redisSub.on('pmessage', (pattern, channel, message) => {
+  const match = channel.match(/^showtime:(.+):seats$/);
+  if (match) {
+    const showtimeId = match[1];
+    const clients = clientsByShowtime.get(showtimeId);
+    if (clients) {
+      for (const client of clients) {
+        if (client.readyState === 1) { // OPEN
+          client.send(message);
+        }
+      }
+    }
+  }
+});
+
 /**
- * GET /movies
+ * 1. Independent Health Check (GET /health)
+ * Must return 200 in <1s independently of Gateway status
+ */
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+/**
+ * 2. System Metrics (GET /metrics)
+ */
+app.get('/metrics', async (req, res, next) => {
+  try {
+    const totalBookingsRes = await query('SELECT COUNT(*) FROM bookings');
+    const confirmedRes = await query("SELECT COUNT(*) FROM bookings WHERE status = 'CONFIRMED'");
+    const failedRes = await query("SELECT COUNT(*) FROM bookings WHERE status = 'FAILED'");
+    const heldRes = await query("SELECT COUNT(*) FROM seat_status WHERE status = 'HELD'");
+
+    res.status(200).json({
+      uptimeSeconds: process.uptime(),
+      totalBookings: parseInt(totalBookingsRes.rows[0].count, 10),
+      confirmedBookings: parseInt(confirmedRes.rows[0].count, 10),
+      failedBookings: parseInt(failedRes.rows[0].count, 10),
+      currentHeldSeats: parseInt(heldRes.rows[0].count, 10),
+      memoryUsageMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * Auth Routes
+ */
+app.post('/auth/login', async (req, res, next) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+    const result = await query(
+      'SELECT id, name, email, phone, role, password FROM users WHERE LOWER(email) = LOWER($1)',
+      [email.trim()]
+    );
+    if (result.rows.length === 0 || result.rows[0].password !== password) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+    const { password: _, ...userData } = result.rows[0];
+    res.status(200).json({ message: 'Login successful', user: userData, token: `token_${userData.id}` });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/auth/users', async (req, res, next) => {
+  try {
+    const result = await query('SELECT id, name, email, phone, role FROM users ORDER BY created_at ASC');
+    res.status(200).json(result.rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * Browsing Routes
  */
 app.get('/movies', async (req, res, next) => {
   try {
-    const result = await query('SELECT id, title, poster_url FROM movies ORDER BY id ASC');
+    const result = await query('SELECT id, title, poster_url, runtime_minutes, rating FROM movies ORDER BY title ASC');
     res.status(200).json(result.rows);
   } catch (err) {
     next(err);
   }
 });
 
-/**
- * GET /showtimes?movie_id=
- */
-app.get('/showtimes', async (req, res, next) => {
+app.get('/movies/:id/showtimes', async (req, res, next) => {
   try {
-    const { movie_id } = req.query;
-    let sql = 'SELECT id, movie_id, theatre_id, start_time FROM showtimes';
-    const params = [];
-
-    if (movie_id) {
-      sql += ' WHERE movie_id = $1';
-      params.push(movie_id);
-    }
-    sql += ' ORDER BY start_time ASC';
-
-    const result = await query(sql, params);
+    const result = await query(`
+      SELECT st.id, st.movie_id, st.screen_id, st.starts_at, t.name as theatre_name
+      FROM showtimes st
+      JOIN screens sc ON sc.id = st.screen_id
+      JOIN theatres t ON t.id = sc.theatre_id
+      WHERE st.movie_id = $1
+      ORDER BY st.starts_at ASC;
+    `, [req.params.id]);
     res.status(200).json(result.rows);
   } catch (err) {
     next(err);
   }
 });
 
-/**
- * GET /seatmap/:showtime_id
- */
-app.get('/seatmap/:showtime_id', async (req, res, next) => {
+app.get(['/showtimes/:id/seats', '/seatmap/:id'], async (req, res, next) => {
   try {
-    const { showtime_id } = req.params;
-
-    const showtimeRes = await query('SELECT id FROM showtimes WHERE id = $1', [showtime_id]);
-    if (showtimeRes.rows.length === 0) {
-      return res.status(404).json({ error: 'Showtime not found' });
-    }
-
-    const seatsRes = await query(
-      `SELECT id AS seat_id, row_label AS row, col_num AS col, status, price 
-       FROM seats 
-       WHERE showtime_id = $1 
-       ORDER BY row_label ASC, col_num ASC`,
-      [showtime_id]
-    );
-
-    res.status(200).json(seatsRes.rows);
+    const seatmap = await bookingService.getSeatMap(req.params.id);
+    res.status(200).json(seatmap);
   } catch (err) {
     next(err);
   }
 });
 
 /**
- * POST /seats/:seat_id/hold
+ * Seat Hold Endpoint (POST /bookings/hold & aliases)
  */
-app.post('/seats/:seat_id/hold', async (req, res, next) => {
+app.post(['/bookings/hold', '/seats/hold', '/seats/:id/hold'], async (req, res, next) => {
   try {
-    const { seat_id } = req.params;
-    const result = await holdSeat(seat_id);
-    metrics.successfulHolds++;
+    const showtimeId = req.body.showtime_id || req.body.showtimeId;
+    const seatId = req.params.id || req.body.seat_id || req.body.seatId;
+    const seatIds = req.body.seat_ids || req.body.seatIds;
+    const userId = req.body.user_id || req.body.userId;
+
+    const result = await bookingService.holdSeat({
+      showtimeId,
+      seatId,
+      seatIds,
+      userId,
+    });
     res.status(200).json(result);
   } catch (err) {
-    if (err.statusCode) {
-      if (err.statusCode === 409) metrics.conflictedHolds++;
-      return res.status(err.statusCode).json({ error: err.message });
+    if (err.status) {
+      return res.status(err.status).json({ error: err.message });
     }
     next(err);
   }
 });
 
 /**
- * Read-only booking status endpoint for frontend status polling
+ * OTP Routes
  */
-app.get('/bookings/:booking_ref', async (req, res, next) => {
+app.post(['/bookings/:ref/otp/send', '/otp/send'], async (req, res, next) => {
   try {
-    const { booking_ref } = req.params;
-    const bookingRes = await query(
-      `SELECT b.booking_ref, b.status AS booking_status, b.seat_id, s.hold_expires_at, 
-              p.payment_id, p.status AS payment_status, p.amount 
-       FROM bookings b 
-       JOIN seats s ON b.seat_id = s.id 
-       LEFT JOIN payments p ON b.booking_ref = p.booking_ref 
-       WHERE b.booking_ref = $1 
-       ORDER BY p.id DESC LIMIT 1`,
-      [booking_ref]
-    );
-
-    if (bookingRes.rows.length === 0) {
-      return res.status(404).json({ error: 'Booking not found' });
-    }
-
-    res.status(200).json(bookingRes.rows[0]);
+    const ref = req.params.ref || req.body.booking_ref || req.body.reference;
+    const phone = req.body.phone || '01700000000';
+    const result = await bookingService.sendOtp(ref, phone);
+    res.status(200).json(result);
   } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
+
+app.post(['/bookings/:ref/otp/verify', '/otp/verify'], async (req, res, next) => {
+  try {
+    const ref = req.params.ref || req.body.booking_ref || req.body.reference;
+    const code = req.body.code || req.body.otp;
+    const result = await bookingService.verifyOtp(ref, code);
+    res.status(200).json(result);
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
     next(err);
   }
 });
 
 /**
- * ========================================================
- * PERSON 2 ROUTES — PAYMENT, WEBHOOKS, & OTP
- * ========================================================
+ * Payment & Booking Management Routes
  */
+app.post(['/bookings/:ref/pay', '/pay'], async (req, res, next) => {
+  try {
+    const ref = req.params.ref || req.body.booking_ref;
+    const result = await bookingService.initiatePayment(ref, req.body);
+    res.status(202).json(result);
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
+
+app.get('/bookings/:ref', async (req, res, next) => {
+  try {
+    const booking = await bookingService.getBooking(req.params.ref);
+    res.status(200).json(booking);
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
+
+app.post('/bookings/:ref/cancel', async (req, res, next) => {
+  try {
+    const result = await bookingService.cancelBooking(req.params.ref);
+    res.status(200).json(result);
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    next(err);
+  }
+});
 
 /**
- * POST /pay
- * Process payment with Mock Gateway, returning 202/200 PENDING status immediately.
+ * Webhook Endpoint (POST /webhooks/payment)
+ * Fast ACK path (<10ms):
+ * 1. Verify HMAC signature
+ * 2. Deduplicate event_id in processed_webhook_events
+ * 3. Enqueue payload to Redis Queue
+ * 4. Return 200 OK immediately
  */
-app.post('/pay', async (req, res, next) => {
+app.post(['/webhooks/payment', '/webhooks/otp'], async (req, res, next) => {
   try {
-    const { booking_ref, amount, phone } = req.body;
-    const idempotency_key = req.headers['idempotency-key'] || req.headers['x-idempotency-key'];
+    const signature = req.headers['x-signature'];
 
-    const result = await processPayment({
+    // Verify HMAC signature if present
+    if (signature && req.rawBody) {
+      const computedHash = crypto
+        .createHmac('sha256', GATEWAY_SECRET)
+        .update(req.rawBody)
+        .digest('hex');
+
+      if (computedHash !== signature) {
+        console.warn('Invalid Webhook HMAC Signature');
+        return res.status(401).json({ error: 'Invalid HMAC signature' });
+      }
+    }
+
+    const { event_id, payment_id, booking_ref, status } = req.body;
+
+    if (event_id) {
+      // Fast DB insert for deduplication gate
+      const dedupRes = await query(
+        'INSERT INTO processed_webhook_events (event_id, received_at) VALUES ($1, NOW()) ON CONFLICT (event_id) DO NOTHING',
+        [event_id]
+      );
+
+      // If 0 rows affected -> Duplicate event, return 200 OK immediately
+      if (dedupRes.rowCount === 0) {
+        return res.status(200).json({ status: 'duplicate_ignored' });
+      }
+    }
+
+    // Push event to Redis Queue for async worker service
+    await enqueueWebhookEvent({
+      event_id: event_id || `evt_${Date.now()}`,
+      payment_id,
       booking_ref,
-      amount,
-      phone,
-      idempotency_key,
-      headers: req.headers,
+      status,
+      raw_payload: req.body,
     });
 
-    metrics.paymentsProcessed++;
-    res.status(200).json(result);
+    // Fast ACK in single-digit ms
+    res.status(200).json({ status: 'queued' });
   } catch (err) {
-    if (err.statusCode) {
-      return res.status(err.statusCode).json({ error: err.message });
-    }
-    next(err);
+    console.error('Error handling webhook:', err);
+    res.status(200).json({ status: 'error_handled' });
   }
 });
 
-/**
- * POST /otp/send
- */
-app.post('/otp/send', async (req, res, next) => {
-  try {
-    const booking_ref = req.body.booking_ref || req.body.ref;
-    const { phone } = req.body;
-    const result = await sendOtp(booking_ref, phone, req.headers);
-    res.status(200).json(result);
-  } catch (err) {
-    if (err.statusCode) {
-      return res.status(err.statusCode).json({ error: err.message });
-    }
-    next(err);
-  }
-});
-
-/**
- * POST /otp/verify
- */
-app.post('/otp/verify', async (req, res, next) => {
-  try {
-    const booking_ref = req.body.booking_ref || req.body.ref;
-    const otp = req.body.otp || req.body.code;
-    const result = await verifyOtp(booking_ref, otp);
-    res.status(200).json(result);
-  } catch (err) {
-    if (err.statusCode) {
-      return res.status(err.statusCode).json({ error: err.message });
-    }
-    next(err);
-  }
-});
-
-/**
- * POST /webhooks/otp
- */
-app.post('/webhooks/otp', (req, res) => {
-  if (!verifyWebhookSignature(req)) {
-    return res.status(401).json({ error: 'Invalid HMAC signature' });
-  }
-  res.status(200).json({ status: 'ok' });
-});
-
-/**
- * POST /webhooks/payment & POST /gateway/callback
- */
-const handleWebhook = async (req, res, next) => {
-  try {
-    if (!verifyWebhookSignature(req)) {
-      return res.status(401).json({ error: 'Invalid HMAC signature' });
-    }
-
-    await handlePaymentWebhook(req.body);
-    // Gateway Callback Rule 16: ALWAYS RETURN 2xx (even for duplicates)
-    res.status(200).json({ status: 'ok' });
-  } catch (err) {
-    console.error('Webhook processing notice:', err.message);
-    res.status(200).json({ status: 'ok', warning: err.message });
-  }
-};
-
-app.post('/webhooks/payment', handleWebhook);
-app.post('/gateway/callback', handleWebhook);
-
-// Central Error Handler
+// Centralized Error Handling Middleware
 app.use((err, req, res, next) => {
-  console.error('Unhandled Server Error:', err);
-  const status = err.statusCode || err.status || 500;
-  res.status(status).json({
-    error: status === 500 ? 'Internal server error' : err.message,
+  console.error('Unhandled Error:', err.message, err.stack);
+  res.status(err.status || 500).json({
+    error: err.message || 'Internal Server Error',
   });
 });
 
-const PORT = process.env.PORT || 4000;
-
-async function startServer() {
-  try {
-    console.log('Initializing database schema and seed data...');
-    await initDb();
-    console.log('Database initialized successfully.');
-
-    startExpiryWorker(2000);
-
-    if (process.env.NODE_ENV !== 'test') {
-      app.listen(PORT, () => {
-        console.log(`CinemaSeat Backend running on port ${PORT}`);
-      });
+// Start Server & Seed Database on Startup
+if (require.main === module) {
+  server.listen(PORT, async () => {
+    console.log(`[API Service] Running on port ${PORT}`);
+    try {
+      const { initDb } = require('./db');
+      await initDb();
+      console.log('[API Service] Database initialized & seeded successfully.');
+    } catch (err) {
+      console.error('[API Service] Database initialization error:', err.message);
     }
-  } catch (err) {
-    console.error('Failed to start server:', err);
-    process.exit(1);
-  }
+  });
 }
 
-if (process.env.NODE_ENV !== 'test') {
-  startServer();
-}
-
-module.exports = { app, startServer };
+module.exports = { app, server };

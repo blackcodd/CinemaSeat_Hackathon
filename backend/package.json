@@ -4,18 +4,21 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
+    "worker": "node src/worker.js",
     "dev": "nodemon src/index.js",
     "test": "node src/tests/test_suite.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "CinemaSeat Backend API Service",
   "dependencies": {
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
-    "pg": "^8.22.0"
+    "ioredis": "^5.4.1",
+    "pg": "^8.22.0",
+    "ws": "^8.18.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.14"

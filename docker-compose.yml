@@ -9,30 +9,87 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
- 
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cinemaseat"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   gateway:
     image: asifmahmoud414/mock-gateway:latest
     ports:
       - "9000:9000"
- 
-  backend:
-    build: ./backend
+
+  api-service:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
     ports:
       - "4000:4000"
     environment:
       DATABASE_URL: postgres://cinemaseat:cinemaseat@postgres:5432/cinemaseat
-      HOLD_TTL_SECONDS: 60
+      REDIS_URL: redis://redis:6379
+      HOLD_TTL_SECONDS: 300
       GATEWAY_URL: http://gateway:9000
+      CALLBACK_BASE_URL: http://api-service:4000
+      GATEWAY_SECRET: z2p-2026-secret
     depends_on:
-      - postgres
-      - gateway
- 
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      gateway:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:4000/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1))\""]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  worker-service:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    environment:
+      DATABASE_URL: postgres://cinemaseat:cinemaseat@postgres:5432/cinemaseat
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
   frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
     ports:
       - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:4000
     depends_on:
-      - backend
- 
+      api-service:
+        condition: service_healthy
+
+  nginx:
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+    ports:
+      - "8888:80"
+    depends_on:
+      - api-service
+      - frontend
+
 volumes:
   pgdata:
