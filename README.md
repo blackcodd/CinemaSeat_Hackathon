@@ -190,22 +190,48 @@ WHERE status IN ('HELD', 'CONFIRMED');
 
 ---
 
-## 🔒 Integration & Security Specifications
+## 🔒 Integration & Security Specifications (CinemaSeat Gateway Service)
 
-### 1. Webhook HMAC SHA-256 Verification
-Incoming gateway webhooks are authenticated via HMAC SHA-256 signature validation:
+### 1. Reachable Callback URLs (Docker Compose Networking)
+In containerized environments, callback URLs must be reachable from inside the gateway container:
+- ❌ `http://localhost:3000/webhooks/payment` — *Incorrect (resolves to gateway itself)*
+- 🟢 `http://api-service:4000/webhooks/payment` — *Correct (resolves to CinemaSeat API service container)*
+
+### 2. Idempotent Processing & Double Charge Protection
+- **`Idempotency-Key` Header**: Sent on `POST /charge` using `booking_ref` to ensure gateway returns the identical `payment_id` on retries, preventing double charges.
+- **Event Deduplication**: Duplicate webhook deliveries sharing the same `event_id` are processed idempotently in PostgreSQL:
+```sql
+INSERT INTO processed_webhook_events (event_id, received_at) 
+VALUES ($1, NOW()) 
+ON CONFLICT (event_id) DO NOTHING;
+```
+*If 0 rows affected, API service returns `200 OK` instantly, stopping gateway exponential retries.*
+
+### 3. Webhook HMAC SHA-256 Signature Verification
+Every callback is verified over exact raw request body bytes before JSON parsing:
 ```javascript
-const expectedSignature = crypto
+const expected = crypto
   .createHmac('sha256', process.env.GATEWAY_SECRET || 'z2p-2026-secret')
-  .update(rawBody)
+  .update(req.rawBody)
   .digest('hex');
+
+if (req.get('X-Signature') !== expected) {
+  return res.status(401).json({ error: 'Invalid HMAC signature' });
+}
 ```
 
-### 2. Idempotent Processing
-Duplicate payment callbacks are handled idempotently via PostgreSQL `processed_webhook_events`:
-```sql
-INSERT INTO processed_webhook_events (event_id) 
-VALUES ($1) ON CONFLICT (event_id) DO NOTHING;
+### 4. OTP Verification & Deterministic Testing Mode
+- **Endpoints**: `POST /bookings/:ref/otp/send` and `POST /bookings/:ref/otp/verify`.
+- **Deterministic Mode (`X-Mock-Mode: deterministic`)**: Fixed OTP code is `123456` with 2s delay.
+- **Control Headers (`X-Mock-Force`)**: Supports `success`, `fail`, `duplicate`, `timeout`, and `race` for deterministic judge validation.
+
+### 5. Gateway Debug & Inspection Commands
+```bash
+# Check callback delivery status for a specific booking
+curl -s "http://localhost:9000/debug/deliveries?booking_ref=bk_test" | jq
+
+# Inspect active gateway configuration
+curl -s "http://localhost:9000/debug/config" | jq
 ```
 
 ---
