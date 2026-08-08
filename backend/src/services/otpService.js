@@ -3,7 +3,8 @@ const crypto = require('crypto');
 const { query } = require('../db');
 
 const GATEWAY_URL = process.env.GATEWAY_URL || 'http://gateway:9000';
-const OTP_CALLBACK_URL = process.env.OTP_CALLBACK_URL || 'http://backend:4000/webhooks/otp';
+const CALLBACK_BASE = process.env.CALLBACK_BASE_URL || process.env.OTP_CALLBACK_URL || 'http://api-service:4000';
+const OTP_CALLBACK_URL = `${CALLBACK_BASE.replace(/\/$/, '')}/webhooks/otp`;
 
 function hashOtp(otp) {
   return crypto.createHash('sha256').update(String(otp).trim()).digest('hex');

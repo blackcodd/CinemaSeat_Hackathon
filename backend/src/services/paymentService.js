@@ -4,7 +4,8 @@ const { query } = require('../db');
 const { confirmBooking, failBooking } = require('./bookingService');
 
 const GATEWAY_URL = process.env.GATEWAY_URL || 'http://gateway:9000';
-const WEBHOOK_CALLBACK_URL = process.env.WEBHOOK_CALLBACK_URL || 'http://backend:4000/webhooks/payment';
+const CALLBACK_BASE = process.env.CALLBACK_BASE_URL || process.env.WEBHOOK_CALLBACK_URL || 'http://api-service:4000';
+const WEBHOOK_CALLBACK_URL = `${CALLBACK_BASE.replace(/\/$/, '')}/webhooks/payment`;
 const GATEWAY_SECRET = process.env.GATEWAY_SECRET || 'z2p-2026-secret';
 
 // In-memory idempotency cache for Idempotency-Key header support
