@@ -18,6 +18,13 @@ A zero-oversell, high-concurrency cinema booking microservice stack built with *
 
 ---
 
+## 📖 System Architecture Deep-Dive
+
+For a comprehensive technical breakdown of our engineering decisions across **Concurrency Handling**, **Payment Gateway Integration**, and **System Reliability**, please see the dedicated reference document:
+👉 **[docs/SYSTEM_ARCHITECTURE_DETAILS.md](docs/SYSTEM_ARCHITECTURE_DETAILS.md)**
+
+---
+
 ## 📋 Requirement Specifications
 
 Below is the matrix mapping official **Zero to Production Phase 2 Hackathon Rulebook** specifications to implementation details:
