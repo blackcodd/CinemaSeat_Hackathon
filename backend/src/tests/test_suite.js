@@ -157,7 +157,11 @@ async function runTests() {
   console.log(` TEST SUMMARY: ${passed} PASSED | ${failed} FAILED`);
   console.log('==============================================\n');
 
-  if (failed > 0) process.exit(1);
+  if (failed > 0) {
+    process.exit(1);
+  } else {
+    process.exit(0);
+  }
 }
 
 if (require.main === module) {
