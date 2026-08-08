@@ -71,6 +71,7 @@ async function runTests() {
   }
 
   try {
+    await initDb();
     server = app.listen(PORT);
     await new Promise((r) => setTimeout(r, 1500));
 
