@@ -7,6 +7,16 @@ A zero-oversell, high-concurrency cinema booking microservice stack built with *
 
 ---
 
+## 📺 Project System Overview (Video Walkthrough & Architecture)
+
+> 🎥 **Watch the Complete Project Overview & System Architecture Video Walkthrough:**
+> 
+> [![CinemaSeat Project Overview & Architecture Walkthrough](https://img.shields.io/badge/▶️%20Watch%20Video-CinemaSeat%20Project%20Overview%20%26%20System%20Architecture-red?style=for-the-badge&logo=google-drive)](https://drive.google.com/file/d/1XkGg3HOJgV3XaZMuzGx0NFIB4OjvHb10/view?usp=sharing)
+>
+> 🔗 **Direct Drive Link**: [https://drive.google.com/file/d/1XkGg3HOJgV3XaZMuzGx0NFIB4OjvHb10/view?usp=sharing](https://drive.google.com/file/d/1XkGg3HOJgV3XaZMuzGx0NFIB4OjvHb10/view?usp=sharing)
+
+---
+
 ## 🌐 Live Production Deployment
 
 | Service | Public URL / Endpoint | Status |
