@@ -54,7 +54,7 @@ function request(method, path, body = null, headers = {}) {
 
 async function runTests() {
   console.log('==============================================');
-  console.log('   STARTING PERSON 2 COMPLETE TEST SUITE');
+  console.log('   STARTING COMPLETE SYSTEM TEST SUITE (P1+P2+P3)');
   console.log('==============================================\n');
 
   let passed = 0;
@@ -178,7 +178,7 @@ async function runTests() {
     // ========================================================
     // PERSON 2 TESTS (OTP, PAYMENT, WEBHOOK, IDEMPOTENCY, SECURITY)
     // ========================================================
-    console.log('\n--- Running Person 2 Tests (OTP, Payment, Webhooks, HMAC) ---');
+    console.log('\n--- Running Person 2 & 3 Tests (OTP, Payment, Webhooks, Status Polling) ---');
 
     // TEST 13: Deterministic OTP Send
     const otpSendRes = await request(
@@ -291,6 +291,13 @@ async function runTests() {
 
     const seat6Res = await query('SELECT status FROM seats WHERE id = $1', [s6]);
     await assert(seat6Res.rows[0].status === 'CONFIRMED', 'Seat 6 confirmed by early webhook callback');
+
+    // TEST 22 (PERSON 3): Read-only status polling endpoint GET /bookings/:booking_ref
+    const statusPollingRes = await request('GET', `/bookings/${hold6.body.booking_ref}`);
+    await assert(
+      statusPollingRes.status === 200 && statusPollingRes.body.booking_status === 'CONFIRMED' && statusPollingRes.body.payment_status === 'SUCCEEDED',
+      'GET /bookings/:booking_ref returns confirmed status for polling'
+    );
 
   } catch (err) {
     console.error('Test execution error:', err);

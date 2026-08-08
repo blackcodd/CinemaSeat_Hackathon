@@ -105,6 +105,33 @@ app.post('/seats/:seat_id/hold', async (req, res, next) => {
 });
 
 /**
+ * Read-only booking status endpoint for frontend status polling
+ */
+app.get('/bookings/:booking_ref', async (req, res, next) => {
+  try {
+    const { booking_ref } = req.params;
+    const bookingRes = await query(
+      `SELECT b.booking_ref, b.status AS booking_status, b.seat_id, s.hold_expires_at, 
+              p.payment_id, p.status AS payment_status, p.amount 
+       FROM bookings b 
+       JOIN seats s ON b.seat_id = s.id 
+       LEFT JOIN payments p ON b.booking_ref = p.booking_ref 
+       WHERE b.booking_ref = $1 
+       ORDER BY p.id DESC LIMIT 1`,
+      [booking_ref]
+    );
+
+    if (bookingRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Booking not found' });
+    }
+
+    res.status(200).json(bookingRes.rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
  * ========================================================
  * PERSON 2 ROUTES — PAYMENT, WEBHOOKS, & OTP
  * ========================================================
