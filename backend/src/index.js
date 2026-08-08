@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const { query, initDb } = require('./db');
@@ -10,6 +11,39 @@ const { processPayment, handlePaymentWebhook, verifyWebhookSignature } = require
 
 const app = express();
 app.use(cors());
+
+// Observability & Metrics State
+const metrics = {
+  totalRequests: 0,
+  successfulHolds: 0,
+  conflictedHolds: 0,
+  paymentsProcessed: 0,
+  startTime: Date.now(),
+};
+
+// Request ID & Structured Logging Middleware
+app.use((req, res, next) => {
+  const requestId = req.headers['x-request-id'] || crypto.randomUUID();
+  req.requestId = requestId;
+  res.setHeader('X-Request-ID', requestId);
+  metrics.totalRequests++;
+
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    console.log(
+      JSON.stringify({
+        timestamp: new Date().toISOString(),
+        requestId,
+        method: req.method,
+        path: req.originalUrl,
+        status: res.statusCode,
+        durationMs: duration,
+      })
+    );
+  });
+  next();
+});
 
 // Express middleware capturing rawBody for HMAC-SHA256 signature verification
 app.use(
@@ -26,6 +60,22 @@ app.use(
  */
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok' });
+});
+
+/**
+ * BONUS: GET /metrics
+ * Observability endpoint for system monitoring
+ */
+app.get('/metrics', (req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    uptimeSeconds: Math.floor((Date.now() - metrics.startTime) / 1000),
+    totalRequests: metrics.totalRequests,
+    successfulHolds: metrics.successfulHolds,
+    conflictedHolds: metrics.conflictedHolds,
+    paymentsProcessed: metrics.paymentsProcessed,
+    memoryUsageMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+  });
 });
 
 /**
@@ -95,9 +145,11 @@ app.post('/seats/:seat_id/hold', async (req, res, next) => {
   try {
     const { seat_id } = req.params;
     const result = await holdSeat(seat_id);
+    metrics.successfulHolds++;
     res.status(200).json(result);
   } catch (err) {
     if (err.statusCode) {
+      if (err.statusCode === 409) metrics.conflictedHolds++;
       return res.status(err.statusCode).json({ error: err.message });
     }
     next(err);
@@ -154,6 +206,7 @@ app.post('/pay', async (req, res, next) => {
       headers: req.headers,
     });
 
+    metrics.paymentsProcessed++;
     res.status(200).json(result);
   } catch (err) {
     if (err.statusCode) {
