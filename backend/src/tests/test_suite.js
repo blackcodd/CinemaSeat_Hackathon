@@ -8,7 +8,7 @@ const { app } = require('../index');
 const PORT = 4001; // Separate test port
 let server = null;
 
-function request(method, path, body = null) {
+function request(method, path, body = null, headers = {}) {
   return new Promise((resolve, reject) => {
     const options = {
       hostname: 'localhost',
@@ -17,6 +17,7 @@ function request(method, path, body = null) {
       method: method,
       headers: {
         'Content-Type': 'application/json',
+        ...headers,
       },
     };
 
@@ -45,7 +46,7 @@ function request(method, path, body = null) {
 
 async function runTests() {
   console.log('==============================================');
-  console.log('   STARTING PERSON 1 TEST SUITE');
+  console.log('   STARTING FULL SYSTEM TEST SUITE (P1 + P2)');
   console.log('==============================================\n');
 
   let passed = 0;
@@ -68,6 +69,10 @@ async function runTests() {
 
     server = app.listen(PORT);
     console.log(`Test server running on port ${PORT}\n`);
+
+    // ========================================================
+    // PERSON 1 TESTS (19 TOTAL)
+    // ========================================================
 
     // TEST 1: GET /health
     const health = await request('GET', '/health');
@@ -165,6 +170,103 @@ async function runTests() {
     await assert(conflictCount === 99, `Exact 99 requests rejected with 409 Conflict (Got: ${conflictCount})`);
     await assert(dbBookings.rows.length === 1, `Exact 1 booking created in PostgreSQL (Got: ${dbBookings.rows.length})`);
     await assert(dbSeat.rows[0].status === 'HELD', `Seat status in DB is HELD`);
+
+    // ========================================================
+    // PERSON 2 TESTS (OTP, PAYMENT, WEBHOOK, IDEMPOTENCY)
+    // ========================================================
+    console.log('\n--- Running Person 2 Tests (OTP, Payment, Webhooks) ---');
+
+    // TEST 13: OTP Send
+    const otpSendRes = await request('POST', '/otp/send', {
+      booking_ref: hold1.body.booking_ref,
+      phone: '+8801700000000',
+    });
+    await assert(
+      otpSendRes.status === 200 && otpSendRes.body.status === 'sent' && otpSendRes.body.otp,
+      'POST /otp/send generates and stores hashed OTP'
+    );
+
+    // Verify OTP in DB is hashed, not plaintext
+    const dbOtp = await query('SELECT otp_hash FROM otp_verifications WHERE booking_ref = $1', [hold1.body.booking_ref]);
+    await assert(
+      dbOtp.rows.length > 0 && dbOtp.rows[0].otp_hash !== otpSendRes.body.otp,
+      'OTP stored in DB is hashed (never plaintext)'
+    );
+
+    // TEST 14: OTP Verify with Invalid OTP
+    const otpBadVerify = await request('POST', '/otp/verify', {
+      booking_ref: hold1.body.booking_ref,
+      otp: '000000',
+    });
+    await assert(otpBadVerify.status === 400, 'POST /otp/verify rejects invalid OTP with 400');
+
+    // TEST 15: OTP Verify with Correct OTP
+    const otpGoodVerify = await request('POST', '/otp/verify', {
+      booking_ref: hold1.body.booking_ref,
+      otp: otpSendRes.body.otp,
+    });
+    await assert(
+      otpGoodVerify.status === 200 && otpGoodVerify.body.verified === true,
+      'POST /otp/verify approves valid OTP'
+    );
+
+    // TEST 16: Payment Processing (/pay)
+    const payRes = await request(
+      'POST',
+      '/pay',
+      {
+        booking_ref: hold1.body.booking_ref,
+        amount: 400,
+        phone: '+8801700000000',
+      },
+      { 'Idempotency-Key': 'key_test_12345' }
+    );
+    await assert(
+      payRes.status === 200 && payRes.body.payment_id && payRes.body.status,
+      'POST /pay initiates payment transaction'
+    );
+
+    // TEST 17: Idempotency Key Retries
+    const payRetryRes = await request(
+      'POST',
+      '/pay',
+      {
+        booking_ref: hold1.body.booking_ref,
+        amount: 400,
+        phone: '+8801700000000',
+      },
+      { 'Idempotency-Key': 'key_test_12345' }
+    );
+    await assert(
+      payRetryRes.status === 200 && payRetryRes.body.payment_id === payRes.body.payment_id,
+      'POST /pay with same Idempotency-Key returns cached response'
+    );
+
+    // TEST 18: Payment Webhook Callback (/webhooks/payment)
+    const webhookRes = await request('POST', '/webhooks/payment', {
+      booking_ref: hold1.body.booking_ref,
+      payment_id: payRes.body.payment_id,
+      event_id: 'evt_webhook_test_1',
+      status: 'SUCCEEDED',
+      amount: 400,
+    });
+    await assert(webhookRes.status === 200 && webhookRes.body.status === 'ok', 'POST /webhooks/payment accepts payment notification');
+
+    const confirmedSeat1 = await query('SELECT status FROM seats WHERE id = $1', [s1]);
+    await assert(confirmedSeat1.rows[0].status === 'CONFIRMED', 'Seat 1 updated to CONFIRMED via payment webhook');
+
+    // TEST 19: Duplicate Webhook Callback Deduplication
+    const dupWebhookRes = await request('POST', '/webhooks/payment', {
+      booking_ref: hold1.body.booking_ref,
+      payment_id: payRes.body.payment_id,
+      event_id: 'evt_webhook_test_1',
+      status: 'SUCCEEDED',
+      amount: 400,
+    });
+    await assert(
+      dupWebhookRes.status === 200 && dupWebhookRes.body.status === 'ok',
+      'POST /webhooks/payment handles duplicate callback idempotently'
+    );
 
   } catch (err) {
     console.error('Test execution error:', err);

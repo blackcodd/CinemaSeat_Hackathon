@@ -5,6 +5,8 @@ require('dotenv').config();
 const { query, initDb } = require('./db');
 const { holdSeat } = require('./services/bookingService');
 const { startExpiryWorker } = require('./services/expiryWorker');
+const { sendOtp, verifyOtp } = require('./services/otpService');
+const { processPayment, handlePaymentWebhook, verifyWebhookSignature } = require('./services/paymentService');
 
 const app = express();
 app.use(cors());
@@ -59,7 +61,6 @@ app.get('/seatmap/:showtime_id', async (req, res, next) => {
   try {
     const { showtime_id } = req.params;
 
-    // Check if showtime exists
     const showtimeRes = await query('SELECT id FROM showtimes WHERE id = $1', [showtime_id]);
     if (showtimeRes.rows.length === 0) {
       return res.status(404).json({ error: 'Showtime not found' });
@@ -94,6 +95,91 @@ app.post('/seats/:seat_id/hold', async (req, res, next) => {
     next(err);
   }
 });
+
+/**
+ * ========================================================
+ * PERSON 2 ROUTES — PAYMENT, WEBHOOKS, & OTP
+ * ========================================================
+ */
+
+/**
+ * POST /pay
+ * Process payment with Mock Gateway, supporting Idempotency-Key and control headers.
+ */
+app.post('/pay', async (req, res, next) => {
+  try {
+    const { booking_ref, amount, phone } = req.body;
+    const idempotency_key = req.headers['idempotency-key'] || req.headers['x-idempotency-key'];
+    
+    const result = await processPayment({
+      booking_ref,
+      amount,
+      phone,
+      idempotency_key,
+      headers: req.headers,
+    });
+
+    res.status(200).json(result);
+  } catch (err) {
+    if (err.statusCode) {
+      return res.status(err.statusCode).json({ error: err.message });
+    }
+    next(err);
+  }
+});
+
+/**
+ * POST /otp/send
+ */
+app.post('/otp/send', async (req, res, next) => {
+  try {
+    const { booking_ref, phone } = req.body;
+    const result = await sendOtp(booking_ref, phone);
+    res.status(200).json(result);
+  } catch (err) {
+    if (err.statusCode) {
+      return res.status(err.statusCode).json({ error: err.message });
+    }
+    next(err);
+  }
+});
+
+/**
+ * POST /otp/verify
+ */
+app.post('/otp/verify', async (req, res, next) => {
+  try {
+    const { booking_ref, otp } = req.body;
+    const result = await verifyOtp(booking_ref, otp);
+    res.status(200).json(result);
+  } catch (err) {
+    if (err.statusCode) {
+      return res.status(err.statusCode).json({ error: err.message });
+    }
+    next(err);
+  }
+});
+
+/**
+ * POST /webhooks/payment & POST /gateway/callback
+ */
+const handleWebhook = async (req, res, next) => {
+  try {
+    if (!verifyWebhookSignature(req)) {
+      return res.status(401).json({ error: 'Invalid HMAC signature' });
+    }
+
+    await handlePaymentWebhook(req.body);
+    res.status(200).json({ status: 'ok' });
+  } catch (err) {
+    console.error('Webhook processing error:', err);
+    // Webhook should respond HTTP 200 to gateway unless payload is bad
+    res.status(200).json({ status: 'ok', warning: err.message });
+  }
+};
+
+app.post('/webhooks/payment', handleWebhook);
+app.post('/gateway/callback', handleWebhook);
 
 // Central Error Handler
 app.use((err, req, res, next) => {

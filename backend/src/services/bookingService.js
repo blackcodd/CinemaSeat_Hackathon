@@ -194,14 +194,39 @@ async function confirmBooking(bookingRef, paymentId, eventId, amount) {
       [booking.id]
     );
 
-    // Record payment
-    const paymentRes = await client.query(
-      `INSERT INTO payments (booking_ref, payment_id, event_id, status, amount)
-       VALUES ($1, $2, $3, 'SUCCEEDED', $4)
-       ON CONFLICT (event_id) DO UPDATE SET status = 'SUCCEEDED', amount = EXCLUDED.amount
-       RETURNING *`,
-      [bookingRef, paymentId || `pay_${Date.now()}`, eventId || `evt_${Date.now()}`, amount || 0]
-    );
+    // Record payment safely
+    let paymentRes;
+    if (paymentId) {
+      paymentRes = await client.query(
+        `INSERT INTO payments (booking_ref, payment_id, event_id, status, amount)
+         VALUES ($1, $2, $3, 'SUCCEEDED', $4)
+         ON CONFLICT (payment_id) DO UPDATE 
+         SET status = 'SUCCEEDED', 
+             event_id = COALESCE(EXCLUDED.event_id, payments.event_id), 
+             amount = EXCLUDED.amount, 
+             updated_at = NOW()
+         RETURNING *`,
+        [bookingRef, paymentId, eventId || null, amount || 0]
+      );
+    } else if (eventId) {
+      paymentRes = await client.query(
+        `INSERT INTO payments (booking_ref, payment_id, event_id, status, amount)
+         VALUES ($1, $2, $3, 'SUCCEEDED', $4)
+         ON CONFLICT (event_id) DO UPDATE 
+         SET status = 'SUCCEEDED', 
+             amount = EXCLUDED.amount, 
+             updated_at = NOW()
+         RETURNING *`,
+        [bookingRef, `pay_${Date.now()}`, eventId, amount || 0]
+      );
+    } else {
+      paymentRes = await client.query(
+        `INSERT INTO payments (booking_ref, payment_id, event_id, status, amount)
+         VALUES ($1, $2, $3, 'SUCCEEDED', $4)
+         RETURNING *`,
+        [bookingRef, `pay_${Date.now()}`, `evt_${Date.now()}`, amount || 0]
+      );
+    }
 
     await client.query('COMMIT');
 
@@ -268,14 +293,39 @@ async function failBooking(bookingRef, paymentId, eventId, amount) {
       [booking.id]
     );
 
-    // Record payment failure
-    const paymentRes = await client.query(
-      `INSERT INTO payments (booking_ref, payment_id, event_id, status, amount)
-       VALUES ($1, $2, $3, 'FAILED', $4)
-       ON CONFLICT (event_id) DO UPDATE SET status = 'FAILED'
-       RETURNING *`,
-      [bookingRef, paymentId || `pay_fail_${Date.now()}`, eventId || `evt_fail_${Date.now()}`, amount || 0]
-    );
+    // Record payment failure safely
+    let paymentRes;
+    if (paymentId) {
+      paymentRes = await client.query(
+        `INSERT INTO payments (booking_ref, payment_id, event_id, status, amount)
+         VALUES ($1, $2, $3, 'FAILED', $4)
+         ON CONFLICT (payment_id) DO UPDATE 
+         SET status = 'FAILED', 
+             event_id = COALESCE(EXCLUDED.event_id, payments.event_id), 
+             amount = EXCLUDED.amount, 
+             updated_at = NOW()
+         RETURNING *`,
+        [bookingRef, paymentId, eventId || null, amount || 0]
+      );
+    } else if (eventId) {
+      paymentRes = await client.query(
+        `INSERT INTO payments (booking_ref, payment_id, event_id, status, amount)
+         VALUES ($1, $2, $3, 'FAILED', $4)
+         ON CONFLICT (event_id) DO UPDATE 
+         SET status = 'FAILED', 
+             amount = EXCLUDED.amount, 
+             updated_at = NOW()
+         RETURNING *`,
+        [bookingRef, `pay_fail_${Date.now()}`, eventId, amount || 0]
+      );
+    } else {
+      paymentRes = await client.query(
+        `INSERT INTO payments (booking_ref, payment_id, event_id, status, amount)
+         VALUES ($1, $2, $3, 'FAILED', $4)
+         RETURNING *`,
+        [bookingRef, `pay_fail_${Date.now()}`, `evt_fail_${Date.now()}`, amount || 0]
+      );
+    }
 
     await client.query('COMMIT');
     return { success: true, payment: paymentRes.rows[0] };
